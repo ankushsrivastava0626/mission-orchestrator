@@ -252,6 +252,57 @@ def h_mission_get(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def h_mission_events(d: Daemon, p: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the structured audit log for a mission."""
+    (mission_id,) = _require(p, "mission_id")
+    _mission_or_raise(d.conn, mission_id)
+    since = int(p.get("since") or 0)
+    limit = int(p.get("limit") or 100)
+    if limit < 1:
+        limit = 1
+    if limit > 1000:
+        limit = 1000
+    rows = d.conn.execute(
+        "SELECT id, ts, kind, step_id, ping_id, payload FROM events"
+        " WHERE mission_id = ? AND ts >= ? ORDER BY ts DESC, id DESC LIMIT ?",
+        (mission_id, since, limit),
+    ).fetchall()
+    out = []
+    for r in rows:
+        item = dict(r)
+        if item.get("payload"):
+            try:
+                item["payload"] = json.loads(item["payload"])
+            except Exception:
+                pass
+        out.append(item)
+    return out
+
+
+def h_mission_pane_snapshot(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Capture the last N lines of the worker's tmux pane."""
+    (mission_id,) = _require(p, "mission_id")
+    _mission_or_raise(d.conn, mission_id)
+    lines = int(p.get("lines") or 80)
+    if lines < 1:
+        lines = 1
+    if lines > 2000:
+        lines = 2000
+    session = config.tmux_session_name(mission_id)
+    if not runner.tmux_session_exists(session):
+        return {"pane_content": "", "alive": False}
+    import subprocess as _sp
+    res = _sp.run(
+        ["tmux", "capture-pane", "-t", session, "-p", "-S", f"-{lines}"],
+        capture_output=True,
+    )
+    return {
+        "pane_content": res.stdout.decode("utf-8", "replace"),
+        "alive": True,
+        "claude_running": runner.step_running(mission_id),
+    }
+
+
 def h_mission_delete(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     """Permanently delete a mission from the DB. Only terminal-state missions."""
     (mission_id,) = _require(p, "mission_id")
@@ -276,22 +327,57 @@ def h_mission_delete(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
 
 def h_mission_cancel(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     (mission_id,) = _require(p, "mission_id")
+    force = bool(p.get("force", False))
     m = _mission_or_raise(d.conn, mission_id)
-    db.set_mission_state(d.conn, mission_id, "cancelled", finished=True)
-    # Cancel running / pending steps.
+    if m["state"] in ("completed", "cancelled", "failed"):
+        return {"ok": True, "already": m["state"]}
+
+    # Pending steps are cancelled either way.
     d.conn.execute(
         "UPDATE steps SET state = 'cancelled', finished_at = ?"
-        " WHERE mission_id = ? AND state IN ('pending', 'running')",
+        " WHERE mission_id = ? AND state = 'pending'",
         (db.now_ts(), mission_id),
     )
-    runner.tmux_kill_session(mission_id)
-    runner.cleanup_worker_tmp(mission_id)
-    try:
-        vault.purge_mission(mission_id)
-    except vault.VaultError:
-        pass
-    db.log_event(d.conn, mission_id=mission_id, kind="mission_cancelled")
-    return {"ok": True}
+
+    if force or m["state"] == "cancelling":
+        # Hard cancel: immediate teardown, no goodbye.
+        d.conn.execute(
+            "UPDATE steps SET state = 'cancelled', finished_at = ?"
+            " WHERE mission_id = ? AND state = 'running'",
+            (db.now_ts(), mission_id),
+        )
+        db.set_mission_state(d.conn, mission_id, "cancelled", finished=True)
+        runner.tmux_kill_session(mission_id)
+        runner.cleanup_worker_tmp(mission_id)
+        try:
+            vault.purge_mission(mission_id)
+        except Exception:
+            pass
+        db.log_event(
+            d.conn, mission_id=mission_id, kind="mission_cancelled",
+            payload={"mode": "hard"},
+        )
+        return {"ok": True, "mode": "hard"}
+
+    # Soft cancel: interrupt current step if any, queue goodbye OOB, mark
+    # cancelling. Engine drives the goodbye -> teardown transition.
+    running_step = d.conn.execute(
+        "SELECT id FROM steps WHERE mission_id = ? AND state = 'running' LIMIT 1",
+        (mission_id,),
+    ).fetchone()
+    if running_step is not None:
+        runner.tmux_interrupt(mission_id)
+        d.conn.execute(
+            "UPDATE steps SET state = 'cancelled', finished_at = ? WHERE id = ?",
+            (db.now_ts(), running_step["id"]),
+        )
+    db.set_mission_state(d.conn, mission_id, "cancelling", finished=False)
+    d.engine._enqueue_oob(
+        mission_id,
+        {"kind": "cancel_goodbye", "directive": config.CANCEL_GOODBYE_DIRECTIVE},
+    )
+    db.log_event(d.conn, mission_id=mission_id, kind="mission_cancelling")
+    return {"ok": True, "mode": "soft", "goodbye_queued": True}
 
 
 def h_mission_attach_info(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
@@ -353,6 +439,7 @@ def h_step_delete(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
 
 
 def h_step_cancel_current(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    import time as _time
     (mission_id,) = _require(p, "mission_id")
     _mission_or_raise(d.conn, mission_id)
     running = d.conn.execute(
@@ -362,22 +449,20 @@ def h_step_cancel_current(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     ).fetchone()
     if running is None:
         return {"ok": False, "reason": "no_running_step"}
+    runner.tmux_interrupt(mission_id)
+    # Wait briefly for claude to actually exit before marking cancelled, so
+    # the DB state matches reality. Bounded at 3 seconds; if claude is wedged
+    # we proceed anyway (the cancel was best-effort).
+    deadline = _time.time() + 3.0
+    while _time.time() < deadline and runner.step_running(mission_id):
+        _time.sleep(0.1)
+    exited = not runner.step_running(mission_id)
     db.set_step_state(d.conn, running["id"], "cancelled", finished=True)
     db.log_event(
-        d.conn, mission_id=mission_id, kind="step_cancelled", step_id=running["id"]
+        d.conn, mission_id=mission_id, kind="step_cancelled",
+        step_id=running["id"], payload={"exited_cleanly": exited},
     )
-    # Best-effort: send Ctrl-C to the tmux pane to halt claude.
-    runner._run(  # noqa: SLF001
-        [
-            "tmux",
-            "send-keys",
-            "-t",
-            config.tmux_session_name(mission_id),
-            "C-c",
-        ],
-        check=False,
-    )
-    return {"ok": True}
+    return {"ok": True, "exited_cleanly": exited}
 
 
 # --- pings ---
@@ -594,6 +679,8 @@ _HANDLERS: dict[str, Handler] = {
     "mission.get": h_mission_get,
     "mission.cancel": h_mission_cancel,
     "mission.delete": h_mission_delete,
+    "mission.events": h_mission_events,
+    "mission.pane_snapshot": h_mission_pane_snapshot,
     "mission.attach_info": h_mission_attach_info,
     "step.add": h_step_add,
     "step.list": h_step_list,

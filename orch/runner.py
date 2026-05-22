@@ -74,6 +74,13 @@ def tmux_send(session: str, command_line: str) -> None:
     _run(["tmux", "send-keys", "-t", session, command_line, "Enter"])
 
 
+def tmux_interrupt(mission_id: str) -> None:
+    """Send Ctrl-C (SIGINT) to whatever's running in the mission's tmux pane."""
+    session = config.tmux_session_name(mission_id)
+    if tmux_session_exists(session):
+        _run(["tmux", "send-keys", "-t", session, "C-c"], check=False)
+
+
 def tmux_pane_current_command(session: str) -> str | None:
     res = _run(
         ["tmux", "list-panes", "-t", session, "-F", "#{pane_current_command}"],
@@ -166,9 +173,17 @@ def launch_oob(mission_id: str, directive: str) -> None:
 
 
 def step_running(mission_id: str) -> bool:
-    """Heuristic: claude is still the pane's foreground process."""
-    session = config.tmux_session_name(mission_id)
-    cmd = tmux_pane_current_command(session)
-    if cmd is None:
+    """Is a claude process for this mission's session id currently running?
+
+    Uses pgrep against the full command line so the answer survives a human
+    attaching to the tmux pane and running other commands (which would fool
+    a foreground-command check).
+    """
+    try:
+        res = subprocess.run(
+            ["pgrep", "-af", f"claude .*{mission_id}"],
+            capture_output=True,
+        )
+    except FileNotFoundError:
         return False
-    return cmd == CLAUDE_BIN or cmd.endswith("/claude")
+    return res.returncode == 0 and bool(res.stdout.strip())

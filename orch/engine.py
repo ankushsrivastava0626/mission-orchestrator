@@ -8,7 +8,7 @@ import logging
 import sqlite3
 from typing import Any
 
-from . import config, db, runner, vault
+from . import config, db, runner, telegram, vault
 
 log = logging.getLogger(__name__)
 
@@ -43,9 +43,10 @@ class Engine:
         missions = db.list_missions(self.conn)
         now = db.now_ts()
         for m in missions:
-            if m["state"] != "running":
-                continue
-            self._tick_mission(m, now)
+            if m["state"] == "running":
+                self._tick_mission(m, now)
+            elif m["state"] == "cancelling":
+                self._tick_cancelling(m, now)
 
     def _tick_mission(self, m: sqlite3.Row, now: int) -> None:
         mission_id = m["id"]
@@ -67,33 +68,37 @@ class Engine:
             self._on_step_complete(mission_id, running)
             running = None
 
-        # 2. If any OOB queued and no step is running, fire one now.
-        if running is None and self._pending_oob.get(mission_id):
+        # claude_busy: running is None in DB (no tracked step) but claude is still
+        # the foreground process in tmux - i.e. an OOB is in flight. We must NOT
+        # fire another OOB or send keys into the pane in this state.
+        claude_busy = running is None and runner.step_running(mission_id)
+
+        # 2. If any OOB queued and claude is idle, fire one now.
+        if running is None and not claude_busy and self._pending_oob.get(mission_id):
             directive = self._pending_oob[mission_id].pop(0)
             self._launch_oob(mission_id, directive)
             return
 
-        # 3. Heartbeat.
-        if running is None:
-            interval = int(m["heartbeat_interval_s"])
-            last = m["last_heartbeat_at"] or m["created_at"]
-            if now - int(last) >= interval:
-                self._enqueue_oob(
-                    mission_id,
-                    {"kind": "heartbeat", "directive": config.HEARTBEAT_DIRECTIVE},
-                )
-                db.update_mission_heartbeat(self.conn, mission_id, now)
-                db.log_event(
-                    self.conn, mission_id=mission_id, kind="heartbeat_fired"
-                )
+        # 3. Heartbeat. Queue is safe to grow regardless of busy state.
+        interval = int(m["heartbeat_interval_s"])
+        last = m["last_heartbeat_at"] or m["created_at"]
+        if now - int(last) >= interval:
+            self._enqueue_oob(
+                mission_id,
+                {"kind": "heartbeat", "directive": config.HEARTBEAT_DIRECTIVE},
+            )
+            db.update_mission_heartbeat(self.conn, mission_id, now)
+            db.log_event(
+                self.conn, mission_id=mission_id, kind="heartbeat_fired"
+            )
 
-        # 4. on_schedule pings.
+        # 4. on_schedule pings. Same - queue is safe to grow.
         for ping in db.list_pings(self.conn, mission_id):
             if ping["mode_type"] != "on_schedule":
                 continue
-            interval = ping["interval_s"] or 0
-            last = ping["last_fired_at"] or m["created_at"]
-            if interval > 0 and now - int(last) >= int(interval):
+            ping_interval = ping["interval_s"] or 0
+            ping_last = ping["last_fired_at"] or m["created_at"]
+            if ping_interval > 0 and now - int(ping_last) >= int(ping_interval):
                 self._enqueue_oob(
                     mission_id,
                     {
@@ -104,12 +109,12 @@ class Engine:
                 )
                 db.mark_ping_fired(self.conn, ping["id"], now)
 
-        # 5. Pop next pending step if its cue is satisfied.
-        if running is None and not self._pending_oob.get(mission_id):
+        # 5. Pop next pending step if its cue is satisfied AND claude is idle.
+        if running is None and not claude_busy and not self._pending_oob.get(mission_id):
             self._maybe_launch_next_step(mission_id, now)
 
         # 6. Auto-complete if no work remains and claude has exited.
-        if running is None and not self._pending_oob.get(mission_id):
+        if running is None and not claude_busy and not self._pending_oob.get(mission_id):
             self._maybe_complete_mission(m, now)
 
     # ---------- helpers ----------
@@ -225,6 +230,31 @@ class Engine:
                 payload={"error": str(e)},
             )
 
+    # ---------- soft cancel ----------
+
+    def _tick_cancelling(self, m: sqlite3.Row, now: int) -> None:
+        mission_id = m["id"]
+        if runner.step_running(mission_id):
+            # Wait - goodbye OOB or interrupted step is still wrapping up.
+            return
+        if self._pending_oob.get(mission_id):
+            directive = self._pending_oob[mission_id].pop(0)
+            self._launch_oob(mission_id, directive)
+            return
+        # Idle: goodbye is done, finalize.
+        db.set_mission_state(self.conn, mission_id, "cancelled", finished=True)
+        runner.tmux_kill_session(mission_id)
+        runner.cleanup_worker_tmp(mission_id)
+        try:
+            vault.purge_mission(mission_id)
+        except Exception:
+            log.exception("vault purge failed for %s", mission_id)
+        db.log_event(
+            self.conn, mission_id=mission_id, kind="mission_cancelled",
+            payload={"mode": "soft"},
+        )
+        log.info("mission %s soft-cancelled (goodbye delivered)", mission_id)
+
     # ---------- mission completion ----------
 
     def _maybe_complete_mission(self, m: sqlite3.Row, now: int) -> None:
@@ -280,12 +310,43 @@ class Engine:
             session = m["tmux_session"]
             if runner.tmux_session_exists(session):
                 continue
-            log.warning("mission %s: tmux session missing, attempting recovery", m["id"])
             running = self.conn.execute(
                 "SELECT * FROM steps WHERE mission_id = ? AND state = 'running'"
                 " ORDER BY position ASC LIMIT 1",
                 (m["id"],),
             ).fetchone()
+            if running is None:
+                # No running step to recover. Let the normal tick auto-complete
+                # (or sit idle if there are no pending steps yet). Don't bump
+                # restart_count for a benign tmux disappearance.
+                log.info("mission %s: tmux gone but no running step; skipping recovery", m["id"])
+                continue
+            if int(m["restart_count"]) >= config.MAX_RESTARTS:
+                log.error(
+                    "mission %s: %d restart attempts already; marking failed",
+                    m["id"], m["restart_count"],
+                )
+                db.set_mission_state(self.conn, m["id"], "failed", finished=True)
+                db.set_step_state(self.conn, running["id"], "failed", finished=True)
+                db.log_event(
+                    self.conn, mission_id=m["id"],
+                    kind="mission_failed_max_restarts",
+                    payload={"restart_count": m["restart_count"]},
+                )
+                # Catastrophic-fallback telegram: worker cannot be revived to
+                # compose its own message, so the daemon sends a notice. This
+                # is the only place daemon-direct telegram remains.
+                telegram.send(
+                    m["telegram_chat_id"],
+                    (
+                        f"Mission '{m['name']}' failed after {m['restart_count']} "
+                        f"restart attempts. The worker could not be revived. "
+                        f"Last step directive (truncated): "
+                        f"{(running['directive'] or '')[:200]}"
+                    ),
+                )
+                continue
+            log.warning("mission %s: tmux session missing, attempting recovery", m["id"])
             db.bump_restart_count(self.conn, m["id"])
             try:
                 runner.tmux_create_session(m["id"])

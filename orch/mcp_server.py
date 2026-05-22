@@ -243,17 +243,27 @@ HOST_TOOLS: list[Tool] = [
     Tool(
         name="mission.cancel",
         description=(
-            "Cancel a running mission. Hard kill: tmux is torn down, pending and running steps "
-            "marked cancelled, vault namespace purged. The worker does NOT get a chance to send a "
-            "Telegram goodbye - if you want a goodbye, add a final step that calls notify before "
-            "calling cancel.\n\n"
-            "After cancel, mission state is 'cancelled'. The mission row remains in the DB until "
-            "you call mission.delete.\n\n"
-            "Args: {mission_id (required)}.\n\n"
-            "Returns: {ok: true}.\n\n"
-            "Idempotent on terminal missions (no-op if already cancelled/completed/failed)."
+            "Cancel a running mission. Two modes:\n\n"
+            "SOFT (default, force=false): the engine interrupts the current step (Ctrl-C), then "
+            "injects a goodbye directive asking the worker to compose a 1-2 sentence Telegram "
+            "farewell via `notify` describing where it got to. Mission state goes to 'cancelling'; "
+            "once the goodbye delivers and the worker exits idle, the engine tears down tmux + "
+            "vault and marks the mission 'cancelled'. Typical latency: 5-30 seconds.\n\n"
+            "HARD (force=true): immediate teardown. Tmux killed, pending+running steps marked "
+            "cancelled, vault purged. No Telegram goodbye. Use when the worker is stuck or you "
+            "need to stop right now.\n\n"
+            "Args: {mission_id (required), force (optional, default false)}.\n\n"
+            "Returns: {ok: true, mode: 'soft'|'hard', goodbye_queued?: true} or {ok: true, "
+            "already: 'completed'|'cancelled'|'failed'} if no-op.\n\n"
+            "After terminal state, the mission row remains until you call mission.delete."
         ),
-        inputSchema=_obj({"mission_id": {"type": "string"}}, ["mission_id"]),
+        inputSchema=_obj(
+            {
+                "mission_id": {"type": "string"},
+                "force": {"type": "boolean", "description": "true = hard cancel (immediate, no goodbye). false (default) = soft cancel."},
+            },
+            ["mission_id"],
+        ),
     ),
     Tool(
         name="mission.delete",
@@ -271,6 +281,62 @@ HOST_TOOLS: list[Tool] = [
             "  not_found    - no mission with that id."
         ),
         inputSchema=_obj({"mission_id": {"type": "string"}}, ["mission_id"]),
+    ),
+    Tool(
+        name="mission.events",
+        description=(
+            "Read the structured audit log for a mission. Returns timestamped events the daemon "
+            "recorded: step launches, completions, timeouts, heartbeat fires, ping fires, "
+            "notify_sent (when the worker actually called notify), restarts, cancellations, "
+            "completions, errors.\n\n"
+            "Use this to understand what actually happened on a mission without parsing the "
+            "tmux pane. Especially useful for debugging missions where you suspect the worker "
+            "didn't do what you asked.\n\n"
+            "Args:\n"
+            "  mission_id (required)\n"
+            "  since (optional): unix timestamp; only return events with ts >= since.\n"
+            "  limit (optional, default 100, max 1000): max events to return (most recent first).\n\n"
+            "Returns: array of {id, ts (unix), kind, step_id (or null), ping_id (or null), "
+            "payload (JSON object or null)}, ordered newest first.\n\n"
+            "Common `kind` values: mission_created, step_added, step_launched, step_completed, "
+            "step_timed_out, completion_directive_sent, oob_completion_wrap_up_launched, "
+            "oob_heartbeat_launched, oob_ping_launched, notify_sent, heartbeat_fired, ping_fired, "
+            "mission_resumed, mission_completed, mission_cancelled, mission_cancelling, "
+            "mission_failed_max_restarts, secret_accessed, cookies_accessed."
+        ),
+        inputSchema=_obj(
+            {
+                "mission_id": {"type": "string"},
+                "since": {"type": "integer", "description": "Unix timestamp lower bound. Default 0 (all)."},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Max rows. Default 100."},
+            },
+            ["mission_id"],
+        ),
+    ),
+    Tool(
+        name="mission.pane_snapshot",
+        description=(
+            "Capture the last N lines from the mission's tmux pane - a live look at what the "
+            "worker Claude is currently displaying.\n\n"
+            "Use this when you want to see what the worker is doing in real time, including its "
+            "in-progress responses, tool calls, etc. Cheap and read-only.\n\n"
+            "Args:\n"
+            "  mission_id (required)\n"
+            "  lines (optional, default 80, max 2000): how many lines to grab from the bottom.\n\n"
+            "Returns: {\n"
+            "  pane_content: string,        // raw pane text\n"
+            "  alive: boolean,              // is the tmux session present\n"
+            "  claude_running: boolean      // is claude the foreground process right now\n"
+            "}\n\n"
+            "If `alive` is false, the mission's tmux has been torn down (cancelled/completed)."
+        ),
+        inputSchema=_obj(
+            {
+                "mission_id": {"type": "string"},
+                "lines": {"type": "integer", "minimum": 1, "maximum": 2000, "description": "Default 80."},
+            },
+            ["mission_id"],
+        ),
     ),
     Tool(
         name="mission.attach_info",

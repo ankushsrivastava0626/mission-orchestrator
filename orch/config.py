@@ -10,8 +10,6 @@ HOME = Path(os.path.expanduser("~"))
 ORCH_DIR = HOME / ".orch"
 DB_PATH = ORCH_DIR / "orch.db"
 SOCKET_PATH = ORCH_DIR / "orchd.sock"
-PID_PATH = ORCH_DIR / "orchd.pid"
-LOG_PATH = ORCH_DIR / "orchd.log"
 
 PASSWORD_STORE_DIR = HOME / ".password-store"
 
@@ -35,8 +33,15 @@ RESUME_NOTIFY_PREFIX = (
     "the user via the `notify` tool that you were interrupted and what you're picking "
     "back up. Then continue with: "
 )
+CANCEL_GOODBYE_DIRECTIVE = (
+    "The host has requested that this mission be cancelled. Before exiting, send a "
+    "brief goodbye to the user via the `notify` tool. Explain in 1-2 sentences where "
+    "you got to and any partial results or state that may matter. Then stop - the "
+    "mission will be torn down immediately after you exit."
+)
 
 TICK_INTERVAL_S = 1.0
+MAX_RESTARTS = 5
 
 ENV_MASTER_PASSPHRASE = "ORCH_MASTER_PASSPHRASE"
 ENV_TELEGRAM_TOKEN = "ORCH_TELEGRAM_BOT_TOKEN"
