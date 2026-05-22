@@ -84,7 +84,8 @@ The same guide is shipped to the host Claude at MCP-server init time via the `in
 
 6. **Monitor.** `mission.get(mission_id)` returns mission row + steps + pings. State transitions visible in the steps.
 
-7. **Auto-completion.** When the queue drains and the worker exits idle, the engine injects a wrap-up directive ("summarize what you accomplished via notify, then we're done"), waits for it to complete, then tears down. Mission state becomes `completed`.
+7. **Auto-completion.** Only fires when *all* of: no pending steps, no running step, no pings configured, and the worker is idle. The engine injects a wrap-up directive ("summarize what you accomplished via notify"), waits, then tears down. Mission state becomes `completed`.
+   - **If you've configured pings**, the mission stays `running` indefinitely - pings keep firing forever. To end it: `ping.delete` them all (auto-complete kicks in), or `mission.cancel` (soft-cancel with goodbye).
 
 8. **(Optional) Delete.** Once terminal:
    ```

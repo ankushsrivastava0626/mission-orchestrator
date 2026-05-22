@@ -122,9 +122,16 @@ Secrets & Cookies
   3. step.add({mission_id, directive, cue: {type: "immediate"}})  ← first step
   4. step.add(...) more steps with cue: {type: "on_prev_complete"}
   5. mission.get(mission_id) to monitor progress
-  6. Auto-completion: when the queue drains and the worker exits, the engine
-     injects a wrap-up directive asking the worker to summarize via `notify`,
-     then tears down the tmux and purges the vault. State becomes "completed".
+  6. Auto-completion fires ONLY when ALL of these hold:
+       - no pending or running steps
+       - no pings configured on the mission (pings keep the mission alive)
+       - the worker Claude is idle in tmux
+     When triggered, the engine injects a wrap-up directive asking the worker
+     to summarize via `notify`, then tears down the tmux and purges the vault.
+     State becomes "completed".
+     If you've configured pings, the mission will stay in 'running' state
+     indefinitely - call ping.delete to remove them (then auto-complete kicks
+     in on the next tick), or mission.cancel to end the mission explicitly.
   7. mission.delete(mission_id) to remove the row entirely (terminal states only)
 
 =========================  WORKER CAPABILITIES  =========================

@@ -273,6 +273,11 @@ class Engine:
             return
         if runner.step_running(mission_id):
             return
+        # Any host-configured pings mean the mission still has scheduled work,
+        # even if the step queue is empty. Stay running until the host removes
+        # them (ping.delete) or explicitly ends the mission (mission.cancel).
+        if db.list_pings(self.conn, mission_id):
+            return
 
         # Two-phase completion: first inject a wrap-up directive so Claude composes
         # the final Telegram message itself; on the next idle tick, finalize.
