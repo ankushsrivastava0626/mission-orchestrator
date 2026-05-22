@@ -10,7 +10,7 @@ import signal
 import sqlite3
 from typing import Any, Awaitable, Callable
 
-from . import config, db, engine, runner, telegram, vault
+from . import config, db, engine, runner, telegram, telegram_host, vault
 
 log = logging.getLogger(__name__)
 
@@ -63,8 +63,10 @@ class Daemon:
         self.conn: sqlite3.Connection = db.connect()
         db.init_schema(self.conn)
         self.engine = engine.Engine(self.conn)
+        self.tg_host = telegram_host.TelegramHost(self)
         self._server: asyncio.base_events.Server | None = None
         self._engine_task: asyncio.Task | None = None
+        self._tg_host_task: asyncio.Task | None = None
         self._stop = asyncio.Event()
 
     # ---------- lifecycle ----------
@@ -90,6 +92,8 @@ class Daemon:
         log.info("daemon: listening on %s", config.SOCKET_PATH)
 
         self._engine_task = asyncio.create_task(self.engine.run())
+        if self.tg_host.configured():
+            self._tg_host_task = asyncio.create_task(self.tg_host.run())
 
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
@@ -104,11 +108,17 @@ class Daemon:
     async def shutdown(self) -> None:
         log.info("daemon: shutting down")
         self.engine.stop()
+        self.tg_host.stop()
         if self._engine_task:
             try:
                 await asyncio.wait_for(self._engine_task, timeout=5.0)
             except asyncio.TimeoutError:
                 self._engine_task.cancel()
+        if self._tg_host_task:
+            try:
+                await asyncio.wait_for(self._tg_host_task, timeout=5.0)
+            except asyncio.TimeoutError:
+                self._tg_host_task.cancel()
         if self._server:
             self._server.close()
             await self._server.wait_closed()

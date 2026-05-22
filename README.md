@@ -23,9 +23,15 @@ Required system packages: `tmux`, `gpg`, `pass`, `claude`.
 
 ```
 export ORCH_MASTER_PASSPHRASE=<a-strong-passphrase>
-export ORCH_TELEGRAM_BOT_TOKEN=<bot-token>
+export ORCH_TELEGRAM_BOT_TOKEN=<notification-bot-token>      # outbound: worker.notify -> Telegram
+export ORCH_DEFAULT_CHAT_ID=<your-chat-id>                   # default chat for mission.create
+# Optional: inbound /command interface on a SEPARATE bot
+export ORCH_HOST_BOT_TOKEN=<command-bot-token>               # must be a different bot from above
+export ORCH_HOST_ALLOWED_CHAT_IDS=<comma-separated-chat-ids> # who's allowed to send /commands
 orchd start
 ```
+
+If `ORCH_HOST_BOT_TOKEN` and `ORCH_HOST_ALLOWED_CHAT_IDS` are set, orchd will long-poll that bot and accept commands like `/missions`, `/m <id>`, `/step <id> <directive>`, `/cancel <id>`, `/pane <id>`, `/events <id>`, `/secret <id> <name> <value>`, `/heartbeat <id> <s>`, `/delete <id>`, `/help`. Send `/help` in the bot DM for the full list. The bot used here MUST be different from the notification bot - Telegram only allows one polling consumer per bot.
 
 On first start, `orchd` generates a GPG key (`orch-vault`, `orch@localhost`) and initializes the `pass` store under `~/.password-store/` if not already initialized.
 
