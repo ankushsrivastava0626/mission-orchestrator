@@ -242,13 +242,15 @@ class Engine:
             self._launch_oob(mission_id, directive)
             return
         # Idle: goodbye is done, finalize.
+        final_pane = runner.capture_pane_full(mission_id)
+        db.log_event(
+            self.conn, mission_id=mission_id, kind="mission_final_pane",
+            payload={"content": final_pane},
+        )
         db.set_mission_state(self.conn, mission_id, "cancelled", finished=True)
         runner.tmux_kill_session(mission_id)
         runner.cleanup_worker_tmp(mission_id)
-        try:
-            vault.purge_mission(mission_id)
-        except Exception:
-            log.exception("vault purge failed for %s", mission_id)
+        # Vault preserved across cancellation - only mission.delete purges.
         db.log_event(
             self.conn, mission_id=mission_id, kind="mission_cancelled",
             payload={"mode": "soft"},
@@ -281,9 +283,18 @@ class Engine:
 
         # Two-phase completion: first inject a wrap-up directive so Claude composes
         # the final Telegram message itself; on the next idle tick, finalize.
-        wrap_sent = self.conn.execute(
-            "SELECT 1 FROM events WHERE mission_id = ? AND kind = 'completion_directive_sent' LIMIT 1",
+        # Mission can be reopened after completion, so check for wrap-up only
+        # AFTER the most recent mission_created / mission_reopened event.
+        last_cycle = self.conn.execute(
+            "SELECT COALESCE(MAX(ts), 0) AS ts FROM events"
+            " WHERE mission_id = ? AND kind IN ('mission_created', 'mission_reopened')",
             (mission_id,),
+        ).fetchone()
+        cycle_start = int(last_cycle["ts"] or 0)
+        wrap_sent = self.conn.execute(
+            "SELECT 1 FROM events WHERE mission_id = ? AND kind = 'completion_directive_sent'"
+            " AND ts >= ? LIMIT 1",
+            (mission_id, cycle_start),
         ).fetchone()
         if wrap_sent is None:
             self._enqueue_oob(
@@ -295,13 +306,16 @@ class Engine:
             )
             return
 
+        final_pane = runner.capture_pane_full(mission_id)
+        db.log_event(
+            self.conn, mission_id=mission_id, kind="mission_final_pane",
+            payload={"content": final_pane},
+        )
         db.set_mission_state(self.conn, mission_id, "completed", finished=True)
         runner.tmux_kill_session(mission_id)
         runner.cleanup_worker_tmp(mission_id)
-        try:
-            vault.purge_mission(mission_id)
-        except Exception:
-            log.exception("vault purge failed for %s", mission_id)
+        # Vault preserved across completion - secrets/cookies stay until mission.delete.
+        # This also lets the host reopen the mission via step.add and have credentials ready.
         db.log_event(self.conn, mission_id=mission_id, kind="mission_completed")
         log.info("mission %s auto-completed", mission_id)
 

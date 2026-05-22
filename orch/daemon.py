@@ -280,7 +280,7 @@ def h_mission_events(d: Daemon, p: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def h_mission_pane_snapshot(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
-    """Capture the last N lines of the worker's tmux pane."""
+    """Capture the worker's tmux pane content. Live if alive, archived if not."""
     (mission_id,) = _require(p, "mission_id")
     _mission_or_raise(d.conn, mission_id)
     lines = int(p.get("lines") or 80)
@@ -289,17 +289,40 @@ def h_mission_pane_snapshot(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     if lines > 2000:
         lines = 2000
     session = config.tmux_session_name(mission_id)
-    if not runner.tmux_session_exists(session):
-        return {"pane_content": "", "alive": False}
-    import subprocess as _sp
-    res = _sp.run(
-        ["tmux", "capture-pane", "-t", session, "-p", "-S", f"-{lines}"],
-        capture_output=True,
-    )
+
+    def _tail(text: str) -> str:
+        ls = text.split("\n")
+        return "\n".join(ls[-lines:]) if len(ls) > lines else text
+
+    if runner.tmux_session_exists(session):
+        import subprocess as _sp
+        res = _sp.run(
+            ["tmux", "capture-pane", "-t", session, "-p", "-S", f"-{lines}"],
+            capture_output=True,
+        )
+        return {
+            "pane_content": res.stdout.decode("utf-8", "replace"),
+            "alive": True,
+            "claude_running": runner.step_running(mission_id),
+            "source": "live",
+        }
+    # Tmux gone - fall back to the final-pane snapshot logged at teardown.
+    row = d.conn.execute(
+        "SELECT payload FROM events WHERE mission_id = ? AND kind = 'mission_final_pane'"
+        " ORDER BY ts DESC LIMIT 1",
+        (mission_id,),
+    ).fetchone()
+    content = ""
+    if row and row["payload"]:
+        try:
+            content = (json.loads(row["payload"]) or {}).get("content", "") or ""
+        except Exception:
+            content = ""
     return {
-        "pane_content": res.stdout.decode("utf-8", "replace"),
-        "alive": True,
-        "claude_running": runner.step_running(mission_id),
+        "pane_content": _tail(content),
+        "alive": False,
+        "claude_running": False,
+        "source": "archived" if content else "none",
     }
 
 
@@ -346,13 +369,15 @@ def h_mission_cancel(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
             " WHERE mission_id = ? AND state = 'running'",
             (db.now_ts(), mission_id),
         )
+        final_pane = runner.capture_pane_full(mission_id)
+        db.log_event(
+            d.conn, mission_id=mission_id, kind="mission_final_pane",
+            payload={"content": final_pane},
+        )
         db.set_mission_state(d.conn, mission_id, "cancelled", finished=True)
         runner.tmux_kill_session(mission_id)
         runner.cleanup_worker_tmp(mission_id)
-        try:
-            vault.purge_mission(mission_id)
-        except Exception:
-            pass
+        # Vault preserved across cancellation - only mission.delete purges.
         db.log_event(
             d.conn, mission_id=mission_id, kind="mission_cancelled",
             payload={"mode": "hard"},
@@ -391,7 +416,29 @@ def h_mission_attach_info(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
 
 def h_step_add(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     mission_id, directive, cue = _require(p, "mission_id", "directive", "cue")
-    _mission_or_raise(d.conn, mission_id)
+    m = _mission_or_raise(d.conn, mission_id)
+    # Reopen a completed mission: recreate tmux + worker MCP config, transition
+    # state back to 'running'. Claude session UUID persists in claude's storage,
+    # so `claude --resume <mission_id>` brings back full prior context.
+    if m["state"] == "completed":
+        try:
+            runner.tmux_create_session(mission_id)
+            runner.write_worker_mcp_config(mission_id)
+        except runner.RunnerError as e:
+            raise RPCError("reopen_failed", str(e))
+        d.conn.execute(
+            "UPDATE missions SET state = 'running', finished_at = NULL,"
+            " last_heartbeat_at = ? WHERE id = ?",
+            (db.now_ts(), mission_id),
+        )
+        db.log_event(d.conn, mission_id=mission_id, kind="mission_reopened")
+    elif m["state"] != "running":
+        raise RPCError(
+            "not_writable",
+            f"mission state is '{m['state']}'; only running or completed missions "
+            f"accept new steps. completed → automatically reopens; cancelled/failed "
+            f"require mission.delete and a fresh mission.create.",
+        )
     created_by = p.get("created_by", "host")
     position = p.get("position")
     if position is None:

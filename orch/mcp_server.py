@@ -127,12 +127,19 @@ Secrets & Cookies
        - no pings configured on the mission (pings keep the mission alive)
        - the worker Claude is idle in tmux
      When triggered, the engine injects a wrap-up directive asking the worker
-     to summarize via `notify`, then tears down the tmux and purges the vault.
-     State becomes "completed".
+     to summarize via `notify`, then tears down the tmux. State becomes
+     "completed". The vault (secrets + cookies) IS PRESERVED so the mission
+     can be reopened later. The final pane content is archived as an event,
+     accessible via mission.pane_snapshot.
      If you've configured pings, the mission will stay in 'running' state
      indefinitely - call ping.delete to remove them (then auto-complete kicks
      in on the next tick), or mission.cancel to end the mission explicitly.
-  7. mission.delete(mission_id) to remove the row entirely (terminal states only)
+  7. REOPENING: call step.add on a 'completed' mission and it auto-transitions
+     back to 'running'. The Claude session is restored via --resume (full
+     prior context), tmux is recreated, the vault is still there. New step's
+     cue cannot be 'immediate' (use on_prev_complete instead - position > 0).
+  8. mission.delete(mission_id) to remove the row entirely (terminal states
+     only). This is the ONLY operation that purges the vault.
 
 =========================  WORKER CAPABILITIES  =========================
 
@@ -276,15 +283,17 @@ HOST_TOOLS: list[Tool] = [
         name="mission.delete",
         description=(
             "Permanently delete a mission from the database. Only allowed when the mission is in a "
-            "terminal state (completed, cancelled, or failed). If the mission is still running, call "
-            "mission.cancel first.\n\n"
-            "Cascades: deletes all steps and pings for the mission via foreign keys. Best-effort "
-            "cleanup of tmux + vault + worker tmpdir. The events log entries are preserved (their "
-            "mission_id is a free reference, not a foreign key), so you keep an audit trail.\n\n"
+            "terminal state (completed, cancelled, or failed). If still running, call mission.cancel "
+            "first.\n\n"
+            "This is also the ONLY operation that purges the mission's pass vault (secrets + "
+            "cookies). Completion and cancellation no longer purge it - they leave the vault intact "
+            "so the mission can be REOPENED via step.add and credentials are still available.\n\n"
+            "Cascades: removes all steps and pings via foreign keys. The events log entries are "
+            "preserved (no FK), so the audit trail survives the delete.\n\n"
             "Args: {mission_id (required)}.\n\n"
             "Returns: {ok: true}.\n\n"
             "Errors:\n"
-            "  not_terminal - mission is still running; call mission.cancel first.\n"
+            "  not_terminal - mission is still running; cancel first.\n"
             "  not_found    - no mission with that id."
         ),
         inputSchema=_obj({"mission_id": {"type": "string"}}, ["mission_id"]),
@@ -323,19 +332,19 @@ HOST_TOOLS: list[Tool] = [
     Tool(
         name="mission.pane_snapshot",
         description=(
-            "Capture the last N lines from the mission's tmux pane - a live look at what the "
-            "worker Claude is currently displaying.\n\n"
-            "Use this when you want to see what the worker is doing in real time, including its "
-            "in-progress responses, tool calls, etc. Cheap and read-only.\n\n"
+            "Capture the worker's tmux pane content. Works on running AND terminal-state missions:\n"
+            "  - alive tmux → live capture (`source: \"live\"`)\n"
+            "  - torn-down tmux → the final pane snapshot captured at teardown is returned "
+            "(`source: \"archived\"`)\n"
+            "  - no archive present → empty content (`source: \"none\"`)\n\n"
+            "Use this to see what the worker is doing in real time, OR to inspect what it was "
+            "doing right before completion/cancellation. The final-pane snapshot survives until "
+            "the mission is deleted via mission.delete.\n\n"
             "Args:\n"
             "  mission_id (required)\n"
-            "  lines (optional, default 80, max 2000): how many lines to grab from the bottom.\n\n"
-            "Returns: {\n"
-            "  pane_content: string,        // raw pane text\n"
-            "  alive: boolean,              // is the tmux session present\n"
-            "  claude_running: boolean      // is claude the foreground process right now\n"
-            "}\n\n"
-            "If `alive` is false, the mission's tmux has been torn down (cancelled/completed)."
+            "  lines (optional, default 80, max 2000): tail size to return.\n\n"
+            "Returns: {pane_content: string, alive: boolean, claude_running: boolean, source: "
+            "\"live\"|\"archived\"|\"none\"}"
         ),
         inputSchema=_obj(
             {
@@ -365,7 +374,13 @@ HOST_TOOLS: list[Tool] = [
             "Append a directive (prompt) to a mission's step queue. Steps execute in `position` "
             "order, one at a time. The worker reads each directive as a new user message in its "
             "ongoing Claude session - so full context from prior steps carries over.\n\n"
-            "Use this to queue work. The first step of a mission must have cue {\"type\": "
+            "REOPENING: if the mission is in state 'completed', step.add automatically reopens it: "
+            "the tmux session is recreated, the worker MCP config is rewritten, state goes back to "
+            "'running'. The Claude session resumes with full prior context (via --resume). The "
+            "vault (secrets + cookies) is preserved across completion, so credentials are still "
+            "available. NOTE: on reopen, position is > 0, so cue must be on_prev_complete (or one "
+            "of the timeout variants), NOT immediate.\n\n"
+            "Use this to queue work. The first step of a NEW mission must have cue {\"type\": "
             "\"immediate\"} (there's no previous step to wait on). Subsequent steps typically use "
             "{\"type\": \"on_prev_complete\"}.\n\n"
             "Args:\n"

@@ -92,6 +92,20 @@ def tmux_pane_current_command(session: str) -> str | None:
     return out[0] if out else None
 
 
+def capture_pane_full(mission_id: str, scrollback: int = 2000) -> str:
+    """Grab the last `scrollback` lines from the mission's pane. '' if no tmux."""
+    session = config.tmux_session_name(mission_id)
+    if not tmux_session_exists(session):
+        return ""
+    res = _run(
+        ["tmux", "capture-pane", "-t", session, "-p", "-S", f"-{scrollback}"],
+        check=False,
+    )
+    if res.returncode != 0:
+        return ""
+    return res.stdout.decode("utf-8", "replace")
+
+
 def tmux_pane_pid(session: str) -> int | None:
     res = _run(
         ["tmux", "list-panes", "-t", session, "-F", "#{pane_pid}"], check=False

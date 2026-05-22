@@ -84,8 +84,12 @@ The same guide is shipped to the host Claude at MCP-server init time via the `in
 
 6. **Monitor.** `mission.get(mission_id)` returns mission row + steps + pings. State transitions visible in the steps.
 
-7. **Auto-completion.** Only fires when *all* of: no pending steps, no running step, no pings configured, and the worker is idle. The engine injects a wrap-up directive ("summarize what you accomplished via notify"), waits, then tears down. Mission state becomes `completed`.
+7. **Auto-completion.** Only fires when *all* of: no pending steps, no running step, no pings configured, and the worker is idle. The engine injects a wrap-up directive ("summarize what you accomplished via notify"), waits, then tears down the tmux. Mission state becomes `completed`. **The vault is preserved** so the mission can be reopened.
    - **If you've configured pings**, the mission stays `running` indefinitely - pings keep firing forever. To end it: `ping.delete` them all (auto-complete kicks in), or `mission.cancel` (soft-cancel with goodbye).
+
+8. **(Optional) Reopen.** Call `step.add` on a `completed` mission and it transitions back to `running` automatically: tmux is recreated, the worker Claude resumes via `claude --resume` (full prior context), the vault is still there. The new step must use `cue: on_prev_complete` (not `immediate`, since position > 0). `mission.pane_snapshot` returns the archived final pane up until the moment of reopen.
+
+9. **mission.delete** once truly done. This is the only path that purges the vault and removes the mission row.
 
 8. **(Optional) Delete.** Once terminal:
    ```
