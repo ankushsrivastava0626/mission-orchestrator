@@ -63,6 +63,9 @@ def _mission_actions_kb(state: str, sid: str) -> dict:
     rows: list[list[dict]] = [
         [_btn("📺 pane", f"pane:{sid}"), _btn("📜 events", f"events:{sid}")],
     ]
+    # Reply is available for running and completed missions (completed reopens).
+    if state in ("running", "cancelling", "completed"):
+        rows.append([_btn("💬 reply / talk to worker", f"reply:{sid}")])
     if state == "running":
         rows.append([
             _btn("✋ soft cancel", f"cancel:{sid}"),
@@ -212,7 +215,9 @@ class TelegramHost:
     async def _send(
         self, client: httpx.AsyncClient, chat_id: str, text: str,
         reply_to: int | None = None, markup: dict | None = None,
-    ) -> None:
+        force_reply: bool = False,
+    ) -> int | None:
+        """Send a message. Returns the sent message_id (or None on failure)."""
         if len(text) > 3900:
             text = text[:3890] + "\n…[truncated]"
         body: dict[str, Any] = {
@@ -224,6 +229,8 @@ class TelegramHost:
             body["reply_to_message_id"] = reply_to
         if markup is not None:
             body["reply_markup"] = markup
+        elif force_reply:
+            body["reply_markup"] = {"force_reply": True}
         try:
             r = await client.post(
                 f"https://api.telegram.org/bot{self.token}/sendMessage",
@@ -231,12 +238,38 @@ class TelegramHost:
             )
             if r.status_code != 200:
                 body.pop("parse_mode", None)
-                await client.post(
+                r = await client.post(
                     f"https://api.telegram.org/bot{self.token}/sendMessage",
                     json=body, timeout=10,
                 )
+            data = r.json()
+            if data.get("ok"):
+                return data["result"]["message_id"]
         except Exception:
             log.exception("telegram_host send failed")
+        return None
+
+    async def _prompt_reply(
+        self, client: httpx.AsyncClient, chat_id: str, sid: str,
+    ) -> None:
+        try:
+            mid = self._resolve_mid(sid)
+        except CommandError as e:
+            await self._send(client, chat_id, f"❌ {e}")
+            return
+        row = self.daemon.conn.execute(
+            "SELECT name FROM missions WHERE id = ?", (mid,)
+        ).fetchone()
+        name = row["name"] if row else sid
+        prompt_id = await self._send(
+            client, chat_id,
+            f"💬 Reply to *{name}* - type your message and send it:",
+            force_reply=True,
+        )
+        if prompt_id is not None:
+            # Map the prompt message so the user's typed reply routes to this
+            # mission via the same path as replying to a worker notify message.
+            db.map_notify_message(self.daemon.conn, prompt_id, mid)
 
     async def _answer_cb(self, client: httpx.AsyncClient, cb_id: str) -> None:
         try:
@@ -296,6 +329,8 @@ class TelegramHost:
             await self._dispatch_and_send(client, chat_id, "forcecancel", [arg])
         elif action == "delete":
             await self._dispatch_and_send(client, chat_id, "delete", [arg])
+        elif action == "reply":
+            await self._prompt_reply(client, chat_id, arg)
         else:
             await self._send(client, chat_id, f"❌ unknown action `{action}`")
 
