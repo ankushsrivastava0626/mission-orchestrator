@@ -182,6 +182,19 @@ class TelegramHost:
                         chat_id,
                     )
                     continue
+                # If this is a reply to a worker's notify message, route the text
+                # to that worker instead of treating it as a /command.
+                reply_to = msg.get("reply_to_message")
+                if reply_to is not None:
+                    replied_mid = db.mission_for_notify(
+                        self.daemon.conn, reply_to.get("message_id", -1)
+                    )
+                    if replied_mid is not None:
+                        await self._route_reply(
+                            client, chat_id, replied_mid, msg["text"],
+                            msg.get("message_id"),
+                        )
+                        continue
                 await self._handle(client, chat_id, msg["text"], msg.get("message_id"))
             elif "callback_query" in update:
                 cq = update["callback_query"]
@@ -285,6 +298,65 @@ class TelegramHost:
             await self._dispatch_and_send(client, chat_id, "delete", [arg])
         else:
             await self._send(client, chat_id, f"❌ unknown action `{action}`")
+
+    async def _route_reply(
+        self, client: httpx.AsyncClient, chat_id: str, mission_id: str,
+        text: str, msg_id: int | None,
+    ) -> None:
+        """Route a Telegram reply to a worker's notify message back to that worker."""
+        m = self.daemon.conn.execute(
+            "SELECT * FROM missions WHERE id = ?", (mission_id,)
+        ).fetchone()
+        if m is None:
+            await self._send(client, chat_id, "❌ that mission no longer exists", msg_id)
+            return
+        state = m["state"]
+        directive = (
+            f"[The user replied to your Telegram message]: {text}\n\n"
+            f"Act on this, then reply to the user via the `notify` tool with your response."
+        )
+        if state == "running" or state == "cancelling":
+            self.daemon.engine._enqueue_oob(
+                mission_id, {"kind": "user_reply", "directive": directive}
+            )
+            db.log_event(
+                self.daemon.conn, mission_id=mission_id, kind="user_reply_routed",
+            )
+            await self._send(
+                client, chat_id,
+                f"➡️ routed to *{m['name']}* - it'll reply here shortly.", msg_id,
+            )
+            return
+        if state == "completed":
+            # Reopen, run the reply as a one-shot, finalize silently afterward.
+            try:
+                runner.tmux_create_session(mission_id)
+                runner.write_worker_mcp_config(mission_id)
+            except runner.RunnerError as e:
+                await self._send(client, chat_id, f"❌ reopen failed: {e}", msg_id)
+                return
+            self.daemon.conn.execute(
+                "UPDATE missions SET state = 'running', finished_at = NULL,"
+                " last_heartbeat_at = ? WHERE id = ?",
+                (db.now_ts(), mission_id),
+            )
+            db.log_event(self.daemon.conn, mission_id=mission_id, kind="mission_reopened")
+            db.log_event(self.daemon.conn, mission_id=mission_id, kind="user_reply_routed")
+            self.daemon.engine._suppress_wrapup.add(mission_id)
+            self.daemon.engine._enqueue_oob(
+                mission_id, {"kind": "user_reply", "directive": directive}
+            )
+            await self._send(
+                client, chat_id,
+                f"➡️ reopened *{m['name']}* and routed your reply - it'll respond here.",
+                msg_id,
+            )
+            return
+        await self._send(
+            client, chat_id,
+            f"❌ mission *{m['name']}* is {state}; can't route a reply to it.",
+            msg_id,
+        )
 
     async def _handle(
         self, client: httpx.AsyncClient, chat_id: str, text: str,

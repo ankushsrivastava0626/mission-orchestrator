@@ -55,8 +55,14 @@ CREATE TABLE IF NOT EXISTS events (
   ping_id TEXT,
   payload TEXT
 );
+CREATE TABLE IF NOT EXISTS notify_map (
+  telegram_message_id INTEGER PRIMARY KEY,
+  mission_id TEXT NOT NULL,
+  ts INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_steps_mission ON steps(mission_id, position);
 CREATE INDEX IF NOT EXISTS idx_events_mission_ts ON events(mission_id, ts);
+CREATE INDEX IF NOT EXISTS idx_notify_map_mission ON notify_map(mission_id);
 """
 
 
@@ -80,6 +86,22 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+
+
+def map_notify_message(conn: sqlite3.Connection, message_id: int, mission_id: str) -> None:
+    conn.execute(
+        "INSERT OR REPLACE INTO notify_map (telegram_message_id, mission_id, ts)"
+        " VALUES (?, ?, ?)",
+        (int(message_id), mission_id, now_ts()),
+    )
+
+
+def mission_for_notify(conn: sqlite3.Connection, message_id: int) -> str | None:
+    row = conn.execute(
+        "SELECT mission_id FROM notify_map WHERE telegram_message_id = ?",
+        (int(message_id),),
+    ).fetchone()
+    return row["mission_id"] if row else None
 
 
 # ---------- mission helpers ----------

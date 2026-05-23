@@ -20,6 +20,10 @@ class Engine:
         # Per-mission flag: an OOB (heartbeat / on_step_complete) directive is
         # awaiting the current step to finish.
         self._pending_oob: dict[str, list[dict[str, Any]]] = {}
+        # Missions that should finalize WITHOUT a wrap-up summary on the next
+        # idle tick (used for reply-driven one-shot interactions, where the
+        # worker has already responded to the user via notify).
+        self._suppress_wrapup: set[str] = set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -281,6 +285,13 @@ class Engine:
         if db.list_pings(self.conn, mission_id):
             return
 
+        # Reply-driven sessions: the worker already answered the user via notify,
+        # so skip the wrap-up summary and finalize silently.
+        if mission_id in self._suppress_wrapup:
+            self._suppress_wrapup.discard(mission_id)
+            self._finalize_completed(mission_id)
+            return
+
         # Two-phase completion: first inject a wrap-up directive so Claude composes
         # the final Telegram message itself; on the next idle tick, finalize.
         # Mission can be reopened after completion, so check for wrap-up only
@@ -306,6 +317,9 @@ class Engine:
             )
             return
 
+        self._finalize_completed(mission_id)
+
+    def _finalize_completed(self, mission_id: str) -> None:
         final_pane = runner.capture_pane_full(mission_id)
         db.log_event(
             self.conn, mission_id=mission_id, kind="mission_final_pane",
@@ -315,7 +329,6 @@ class Engine:
         runner.tmux_kill_session(mission_id)
         runner.cleanup_worker_tmp(mission_id)
         # Vault preserved across completion - secrets/cookies stay until mission.delete.
-        # This also lets the host reopen the mission via step.add and have credentials ready.
         db.log_event(self.conn, mission_id=mission_id, kind="mission_completed")
         log.info("mission %s auto-completed", mission_id)
 

@@ -711,10 +711,24 @@ def h_notify(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
         raise RPCError("empty_text", "notify text is empty")
     if len(text) > 4000:
         text = text[:3990] + "…"
-    telegram.send(m["telegram_chat_id"], text)
+    chat_id = m["telegram_chat_id"]
+    # Prefer the command bot (bot #2) so the user can reply to this message and
+    # have the reply routed back to this worker. Fall back to the notification
+    # bot (bot #1) if the command bot isn't configured.
+    host_tok = telegram.host_token()
+    routed = "host_bot"
+    if host_tok:
+        msg_id = telegram.send_via(host_tok, chat_id, text)
+        if msg_id is not None:
+            db.map_notify_message(d.conn, msg_id, mission_id)
+        else:
+            routed = "host_bot_failed"
+    else:
+        telegram.send(chat_id, text)
+        routed = "notification_bot"
     db.log_event(
         d.conn, mission_id=mission_id, kind="notify_sent",
-        payload={"chars": len(text)},
+        payload={"chars": len(text), "via": routed},
     )
     return {"ok": True}
 
