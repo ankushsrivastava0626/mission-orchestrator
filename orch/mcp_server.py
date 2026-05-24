@@ -103,12 +103,15 @@ Heartbeat
   free-form status update and send it via `notify`. Use heartbeat.set to
   change the interval; heartbeat.get to read it.
 
-Status Ping (0..N per mission)
-  Host-defined recurring or post-step nudge:
-    mode = {"type": "on_step_complete"}        - fires after each completed step
-    mode = {"type": "on_schedule", "seconds": N} - fires on a wall-clock cadence
-  When firing, the worker receives your `command` text plus an instruction to
-  post the result to Telegram via `notify`.
+Ping (0..N per mission) - autonomous watcher
+  ping.add(condition, action, timeout_s) does NOT poll using Claude turns.
+  Instead the worker writes + tests a standalone script ONCE; that script polls
+  the condition on its own (zero tokens) and only wakes the worker when the
+  condition fires (or when the watchdog sees the script die for timeout_s).
+  Use for any repeated check: a file appears, disk fills, an API has new data,
+  a process dies, a build finishes. Track via mission.events:
+    scripted_ping_added → scripted_ping_ready → scripted_ping_fired.
+  (Pings keep a mission alive - it won't auto-complete while any ping exists.)
 
 Secrets & Cookies
   Per-mission encrypted vault. Use secret.put / cookies.put to store. The
@@ -146,7 +149,7 @@ Secrets & Cookies
 Inside the tmux, the worker has its own (scoped) MCP server with these tools:
   notify(text)                - send a Telegram message (the ONLY user-facing channel)
   queue.list/add/update/delete - recursively manage its own pending steps
-  pings.list/add/update/delete - manage its own status pings
+  pings.list/add/delete       - manage its own watcher pings (scripted)
   mission.status              - read its own mission row
   secrets.list / cookies.list - names only (values via the `msec` CLI)
 
@@ -463,29 +466,29 @@ HOST_TOOLS: list[Tool] = [
         inputSchema=_obj({"mission_id": {"type": "string"}}, ["mission_id"]),
     ),
     Tool(
-        name="scripted_ping.add",
+        name="ping.add",
         description=(
-            "Add a SCRIPTED PING - a token-efficient alternative to ping.add. Instead of waking "
-            "the worker Claude every interval to check a condition (which costs tokens each time), "
-            "this tasks the worker ONCE to write + test a standalone watcher script. The script "
-            "polls the condition autonomously (zero tokens) and only wakes Claude when the "
-            "condition actually fires, or when the watchdog detects the script went silent.\n\n"
-            "Use this for conditions that are checked often but rarely true (disk fills up, a file "
-            "appears, an API returns a new item, a process dies, etc.).\n\n"
+            "Add a ping - a recurring autonomous watcher. The worker writes and TESTS a standalone "
+            "script ONCE; that script then polls your condition on its own (costing ZERO Claude "
+            "tokens) and only wakes the worker when the condition actually becomes true (or when "
+            "the watchdog notices the script died). This is the token-efficient way to do periodic "
+            "checks - Claude is not re-invoked every interval.\n\n"
+            "Use it for anything checked repeatedly: a file appears, disk fills up, an API returns "
+            "something new, a process dies, a build finishes, a price crosses a threshold, etc.\n\n"
             "Args:\n"
             "  mission_id (required)\n"
             "  condition (required): plain-language description of what to watch for. The worker "
-            "translates this into actual check logic in the script.\n"
-            "  action (required): what the worker should do / report when the condition becomes "
-            "true (it composes a notify with this in mind).\n"
-            "  timeout_s (optional, default 600, min 30): watchdog interval. If the script sends no "
-            "alive heartbeat within this window, the worker is re-tasked to inspect and repair it.\n\n"
+            "turns this into real check logic inside the script.\n"
+            "  action (required): what to report / do when it fires (the worker composes a notify "
+            "with this in mind).\n"
+            "  timeout_s (optional, default 600, min 30): watchdog window. If the script stops "
+            "sending alive heartbeats for this long, the worker is automatically re-tasked to "
+            "inspect and repair it.\n\n"
             "Example:\n"
             "  {mission_id, condition: \"disk usage on / exceeds 90%\", action: \"warn me with the "
             "current usage %\", timeout_s: 300}\n\n"
-            "Returns: {scripted_ping_id}. The worker will receive a setup directive, write the "
-            "script, test it, run it in the background, and register it. Track progress via "
-            "mission.events (scripted_ping_added → scripted_ping_ready → scripted_ping_fired)."
+            "Returns: {scripted_ping_id}. Track setup via mission.events: scripted_ping_added → "
+            "scripted_ping_ready (script tested + running) → scripted_ping_fired (condition hit)."
         ),
         inputSchema=_obj(
             {
@@ -498,88 +501,25 @@ HOST_TOOLS: list[Tool] = [
         ),
     ),
     Tool(
-        name="scripted_ping.list",
-        description=(
-            "List a mission's scripted pings with their state (setup | active | broken), "
-            "condition, action, timeout, script path, and last alive timestamp.\n\n"
-            "Args: {mission_id (required)}.\n\n"
-            "Returns: array of scripted_ping rows."
-        ),
-        inputSchema=_obj({"mission_id": {"type": "string"}}, ["mission_id"]),
-    ),
-    Tool(
-        name="scripted_ping.delete",
-        description=(
-            "Delete a scripted ping. NOTE: this removes the daemon's record and stops the "
-            "watchdog, but does not itself kill the worker's background script - if you want the "
-            "script stopped, also tell the worker (e.g. via a reply or step) to kill it.\n\n"
-            "Args: {scripted_ping_id (required)}.\n\n"
-            "Returns: {ok: true}."
-        ),
-        inputSchema=_obj({"scripted_ping_id": {"type": "string"}}, ["scripted_ping_id"]),
-    ),
-    Tool(
-        name="ping.add",
-        description=(
-            "Add a recurring status ping. When the ping fires, the worker is sent the directive: "
-            "`<command>\\n\\nWhen done, post the result via the notify tool.` Worker runs it and "
-            "(if it complies) posts to Telegram.\n\n"
-            "Use this when the user wants periodic updates without you having to queue steps. Two "
-            "modes:\n"
-            "  on_step_complete - fires once after every completed step\n"
-            "  on_schedule      - fires on a wall-clock cadence; needs `seconds`\n\n"
-            "Args:\n"
-            "  mission_id (required)\n"
-            "  command (required): the text directive sent to the worker.\n"
-            "  mode (required): one of the two shapes above.\n\n"
-            "Example periodic uptime check:\n"
-            "  {mission_id, command: \"Run `uptime` and tell me the load average.\", "
-            "mode: {type: \"on_schedule\", seconds: 1800}}\n\n"
-            "Returns: {ping_id: \"<uuid>\"}"
-        ),
-        inputSchema=_obj(
-            {
-                "mission_id": {"type": "string"},
-                "command": {"type": "string", "description": "Directive the worker runs when the ping fires."},
-                "mode": _MODE_SCHEMA,
-            },
-            ["mission_id", "command", "mode"],
-        ),
-    ),
-    Tool(
         name="ping.list",
         description=(
-            "List all pings configured for a mission.\n\n"
+            "List a mission's pings (watchers) with state (setup | active | broken), condition, "
+            "action, timeout, script path, and last-alive timestamp.\n\n"
             "Args: {mission_id (required)}.\n\n"
-            "Returns: array of ping rows: {id, command, mode_type, interval_s (null if on_step_complete), "
-            "last_fired_at, created_by}."
+            "Returns: array of ping rows."
         ),
         inputSchema=_obj({"mission_id": {"type": "string"}}, ["mission_id"]),
-    ),
-    Tool(
-        name="ping.update",
-        description=(
-            "Change a ping's command and/or mode.\n\n"
-            "Args: {ping_id (required), command?, mode?}\n\n"
-            "Returns: {ok: true}"
-        ),
-        inputSchema=_obj(
-            {
-                "ping_id": {"type": "string"},
-                "command": {"type": "string"},
-                "mode": _MODE_SCHEMA,
-            },
-            ["ping_id"],
-        ),
     ),
     Tool(
         name="ping.delete",
         description=(
-            "Remove a ping from a mission. It will no longer fire.\n\n"
-            "Args: {ping_id (required)}\n\n"
-            "Returns: {ok: true}"
+            "Delete a ping (watcher). Stops the daemon's watchdog for it. NOTE: this does not by "
+            "itself kill the worker's already-running background script - if you want it stopped, "
+            "also tell the worker (via a reply or step) to kill the script.\n\n"
+            "Args: {scripted_ping_id (required)} - the id returned by ping.add.\n\n"
+            "Returns: {ok: true}."
         ),
-        inputSchema=_obj({"ping_id": {"type": "string"}}, ["ping_id"]),
+        inputSchema=_obj({"scripted_ping_id": {"type": "string"}}, ["scripted_ping_id"]),
     ),
     Tool(
         name="heartbeat.set",
@@ -707,11 +647,23 @@ def build_host_server() -> Server:
             params = {k: v for k, v in args.items()}
             result = _call("secret.put", {**params, "caller": "host"})
             return _text({"ok": True, "name": args.get("name")})
+        # The host-facing `ping.*` tools are the scripted watcher under the hood.
+        # The old interval-polling ping RPCs (ping.*) remain in the daemon but
+        # are no longer exposed as tools (archived; re-list to revive).
+        rpc = _HOST_PING_RPC.get(name, name)
         params = {**args, "caller": "host"}
-        result = _call(name, params)
+        result = _call(rpc, params)
         return _text(result if result is not None else {"ok": True})
 
     return srv
+
+
+# Host-facing ping tools map to the scripted-ping RPCs (transparent swap).
+_HOST_PING_RPC: dict[str, str] = {
+    "ping.add": "scripted_ping.add",
+    "ping.list": "scripted_ping.list",
+    "ping.delete": "scripted_ping.delete",
+}
 
 
 # ---------- worker mode ----------
@@ -765,42 +717,29 @@ def _worker_tools() -> list[Tool]:
         ),
         Tool(
             name="pings.list",
-            description="List this mission's pings.",
+            description="List this mission's pings (autonomous watcher scripts) and their state.",
             inputSchema=_obj({}, []),
         ),
         Tool(
             name="pings.add",
-            description="Add a status ping.",
-            inputSchema=_obj(
-                {"command": {"type": "string"}, "mode": _MODE_SCHEMA},
-                ["command", "mode"],
+            description=(
+                "Add a ping - a watcher you (the worker) implement as a standalone script that "
+                "polls a condition without spending tokens, then wakes you only when it fires. "
+                "After this call you'll receive a setup directive telling you to write, test, "
+                "background the script, and register it with `owatch ready`."
             ),
-        ),
-        Tool(
-            name="pings.update",
-            description="Update a ping.",
             inputSchema=_obj(
                 {
-                    "ping_id": {"type": "string"},
-                    "command": {"type": "string"},
-                    "mode": _MODE_SCHEMA,
+                    "condition": {"type": "string", "description": "What to watch for."},
+                    "action": {"type": "string", "description": "What to report when it fires."},
+                    "timeout_s": {"type": "integer", "minimum": 30},
                 },
-                ["ping_id"],
+                ["condition", "action"],
             ),
         ),
         Tool(
             name="pings.delete",
-            description="Delete a ping.",
-            inputSchema=_obj({"ping_id": {"type": "string"}}, ["ping_id"]),
-        ),
-        Tool(
-            name="scripted_pings.list",
-            description="List this mission's scripted pings (watcher scripts) and their state.",
-            inputSchema=_obj({}, []),
-        ),
-        Tool(
-            name="scripted_pings.delete",
-            description="Delete one of this mission's scripted pings by id (stops the watchdog).",
+            description="Delete one of this mission's pings by id (stops the watchdog).",
             inputSchema=_obj({"scripted_ping_id": {"type": "string"}}, ["scripted_ping_id"]),
         ),
         Tool(
@@ -848,16 +787,10 @@ def build_worker_server(mission_id: str) -> Server:
         if name == "queue.delete":
             return _text(_call("step.delete", a))
         if name == "pings.list":
-            return _text(_call("ping.list", {"mission_id": mission_id}))
-        if name == "pings.add":
-            return _text(_call("ping.add", {**a, "created_by": "worker"}))
-        if name == "pings.update":
-            return _text(_call("ping.update", a))
-        if name == "pings.delete":
-            return _text(_call("ping.delete", a))
-        if name == "scripted_pings.list":
             return _text(_call("scripted_ping.list", {"mission_id": mission_id}))
-        if name == "scripted_pings.delete":
+        if name == "pings.add":
+            return _text(_call("scripted_ping.add", {**a, "created_by": "worker"}))
+        if name == "pings.delete":
             return _text(_call("scripted_ping.delete", a))
         if name == "heartbeat.get":
             return _text(_call("heartbeat.get", {"mission_id": mission_id}))
