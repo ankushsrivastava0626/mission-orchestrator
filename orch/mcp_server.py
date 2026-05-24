@@ -463,6 +463,62 @@ HOST_TOOLS: list[Tool] = [
         inputSchema=_obj({"mission_id": {"type": "string"}}, ["mission_id"]),
     ),
     Tool(
+        name="scripted_ping.add",
+        description=(
+            "Add a SCRIPTED PING - a token-efficient alternative to ping.add. Instead of waking "
+            "the worker Claude every interval to check a condition (which costs tokens each time), "
+            "this tasks the worker ONCE to write + test a standalone watcher script. The script "
+            "polls the condition autonomously (zero tokens) and only wakes Claude when the "
+            "condition actually fires, or when the watchdog detects the script went silent.\n\n"
+            "Use this for conditions that are checked often but rarely true (disk fills up, a file "
+            "appears, an API returns a new item, a process dies, etc.).\n\n"
+            "Args:\n"
+            "  mission_id (required)\n"
+            "  condition (required): plain-language description of what to watch for. The worker "
+            "translates this into actual check logic in the script.\n"
+            "  action (required): what the worker should do / report when the condition becomes "
+            "true (it composes a notify with this in mind).\n"
+            "  timeout_s (optional, default 600, min 30): watchdog interval. If the script sends no "
+            "alive heartbeat within this window, the worker is re-tasked to inspect and repair it.\n\n"
+            "Example:\n"
+            "  {mission_id, condition: \"disk usage on / exceeds 90%\", action: \"warn me with the "
+            "current usage %\", timeout_s: 300}\n\n"
+            "Returns: {scripted_ping_id}. The worker will receive a setup directive, write the "
+            "script, test it, run it in the background, and register it. Track progress via "
+            "mission.events (scripted_ping_added → scripted_ping_ready → scripted_ping_fired)."
+        ),
+        inputSchema=_obj(
+            {
+                "mission_id": {"type": "string"},
+                "condition": {"type": "string", "description": "What to watch for (plain language)."},
+                "action": {"type": "string", "description": "What to report when it fires."},
+                "timeout_s": {"type": "integer", "minimum": 30, "description": "Watchdog window. Default 600."},
+            },
+            ["mission_id", "condition", "action"],
+        ),
+    ),
+    Tool(
+        name="scripted_ping.list",
+        description=(
+            "List a mission's scripted pings with their state (setup | active | broken), "
+            "condition, action, timeout, script path, and last alive timestamp.\n\n"
+            "Args: {mission_id (required)}.\n\n"
+            "Returns: array of scripted_ping rows."
+        ),
+        inputSchema=_obj({"mission_id": {"type": "string"}}, ["mission_id"]),
+    ),
+    Tool(
+        name="scripted_ping.delete",
+        description=(
+            "Delete a scripted ping. NOTE: this removes the daemon's record and stops the "
+            "watchdog, but does not itself kill the worker's background script - if you want the "
+            "script stopped, also tell the worker (e.g. via a reply or step) to kill it.\n\n"
+            "Args: {scripted_ping_id (required)}.\n\n"
+            "Returns: {ok: true}."
+        ),
+        inputSchema=_obj({"scripted_ping_id": {"type": "string"}}, ["scripted_ping_id"]),
+    ),
+    Tool(
         name="ping.add",
         description=(
             "Add a recurring status ping. When the ping fires, the worker is sent the directive: "
@@ -738,6 +794,16 @@ def _worker_tools() -> list[Tool]:
             inputSchema=_obj({"ping_id": {"type": "string"}}, ["ping_id"]),
         ),
         Tool(
+            name="scripted_pings.list",
+            description="List this mission's scripted pings (watcher scripts) and their state.",
+            inputSchema=_obj({}, []),
+        ),
+        Tool(
+            name="scripted_pings.delete",
+            description="Delete one of this mission's scripted pings by id (stops the watchdog).",
+            inputSchema=_obj({"scripted_ping_id": {"type": "string"}}, ["scripted_ping_id"]),
+        ),
+        Tool(
             name="heartbeat.get",
             description="Read-only: get this mission's heartbeat configuration.",
             inputSchema=_obj({}, []),
@@ -789,6 +855,10 @@ def build_worker_server(mission_id: str) -> Server:
             return _text(_call("ping.update", a))
         if name == "pings.delete":
             return _text(_call("ping.delete", a))
+        if name == "scripted_pings.list":
+            return _text(_call("scripted_ping.list", {"mission_id": mission_id}))
+        if name == "scripted_pings.delete":
+            return _text(_call("scripted_ping.delete", a))
         if name == "heartbeat.get":
             return _text(_call("heartbeat.get", {"mission_id": mission_id}))
         if name == "mission.status":

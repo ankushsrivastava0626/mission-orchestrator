@@ -60,6 +60,18 @@ CREATE TABLE IF NOT EXISTS notify_map (
   mission_id TEXT NOT NULL,
   ts INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS scripted_pings (
+  id TEXT PRIMARY KEY,
+  mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
+  condition TEXT NOT NULL,
+  action TEXT NOT NULL,
+  timeout_s INTEGER NOT NULL,
+  state TEXT NOT NULL,            -- setup | active | broken
+  script_path TEXT,
+  last_alive_at INTEGER,
+  created_at INTEGER NOT NULL,
+  created_by TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_steps_mission ON steps(mission_id, position);
 CREATE INDEX IF NOT EXISTS idx_events_mission_ts ON events(mission_id, ts);
 CREATE INDEX IF NOT EXISTS idx_notify_map_mission ON notify_map(mission_id);
@@ -352,6 +364,71 @@ def delete_ping(conn: sqlite3.Connection, ping_id: str) -> None:
 
 def mark_ping_fired(conn: sqlite3.Connection, ping_id: str, ts: int) -> None:
     conn.execute("UPDATE pings SET last_fired_at = ? WHERE id = ?", (ts, ping_id))
+
+
+# ---------- scripted pings (autonomous watcher scripts) ----------
+
+
+def add_scripted_ping(
+    conn: sqlite3.Connection, *, mission_id: str, condition: str,
+    action: str, timeout_s: int, created_by: str,
+) -> str:
+    spid = new_id()
+    conn.execute(
+        "INSERT INTO scripted_pings (id, mission_id, condition, action, timeout_s,"
+        " state, created_at, created_by) VALUES (?, ?, ?, ?, ?, 'setup', ?, ?)",
+        (spid, mission_id, condition, action, int(timeout_s), now_ts(), created_by),
+    )
+    return spid
+
+
+def list_scripted_pings(conn: sqlite3.Connection, mission_id: str) -> list[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM scripted_pings WHERE mission_id = ?", (mission_id,)
+    ).fetchall()
+
+
+def get_scripted_ping(conn: sqlite3.Connection, spid: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM scripted_pings WHERE id = ?", (spid,)).fetchone()
+
+
+def delete_scripted_ping(conn: sqlite3.Connection, spid: str) -> None:
+    conn.execute("DELETE FROM scripted_pings WHERE id = ?", (spid,))
+
+
+def set_scripted_ping_state(
+    conn: sqlite3.Connection, spid: str, state: str,
+    script_path: str | None = None, touch_alive: bool = False,
+) -> None:
+    sets = ["state = ?"]
+    args: list[Any] = [state]
+    if script_path is not None:
+        sets.append("script_path = ?")
+        args.append(script_path)
+    if touch_alive:
+        sets.append("last_alive_at = ?")
+        args.append(now_ts())
+    args.append(spid)
+    conn.execute(f"UPDATE scripted_pings SET {', '.join(sets)} WHERE id = ?", args)
+
+
+def touch_scripted_ping_alive(conn: sqlite3.Connection, spid: str) -> None:
+    conn.execute(
+        "UPDATE scripted_pings SET last_alive_at = ? WHERE id = ?", (now_ts(), spid)
+    )
+
+
+def session_started(conn: sqlite3.Connection, mission_id: str) -> bool:
+    """Has any Claude process been launched for this mission yet? The first
+    launch must use `claude --session-id`; all later ones use `--resume`.
+    Inferred from the event log so it survives daemon restarts."""
+    row = conn.execute(
+        "SELECT 1 FROM events WHERE mission_id = ? AND ("
+        " kind = 'step_launched' OR kind = 'mission_resumed'"
+        " OR kind LIKE 'oob_%_launched') LIMIT 1",
+        (mission_id,),
+    ).fetchone()
+    return row is not None
 
 
 # ---------- events ----------

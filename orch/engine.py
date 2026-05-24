@@ -113,6 +113,9 @@ class Engine:
                 )
                 db.mark_ping_fired(self.conn, ping["id"], now)
 
+        # 4b. Scripted-ping watchdog: re-task the worker to repair silent scripts.
+        self._tick_scripted_pings(mission_id, now)
+
         # 5. Pop next pending step if its cue is satisfied AND claude is idle.
         if running is None and not claude_busy and not self._pending_oob.get(mission_id):
             self._maybe_launch_next_step(mission_id, now)
@@ -135,7 +138,8 @@ class Engine:
 
     def _launch_oob(self, mission_id: str, payload: dict[str, Any]) -> None:
         try:
-            runner.launch_oob(mission_id, payload["directive"])
+            first = not db.session_started(self.conn, mission_id)
+            runner.launch_step(mission_id, payload["directive"], first_step=first)
             db.log_event(
                 self.conn,
                 mission_id=mission_id,
@@ -215,7 +219,10 @@ class Engine:
             return
 
         try:
-            runner.launch_step(mission_id, nxt["directive"], first_step=first_step)
+            # The first Claude launch (step or OOB) creates the session with
+            # --session-id; everything after resumes it.
+            session_first = not db.session_started(self.conn, mission_id)
+            runner.launch_step(mission_id, nxt["directive"], first_step=session_first)
             db.set_step_state(self.conn, nxt["id"], "running", started=True)
             db.log_event(
                 self.conn,
@@ -232,6 +239,30 @@ class Engine:
                 kind="step_launch_failed",
                 step_id=nxt["id"],
                 payload={"error": str(e)},
+            )
+
+    # ---------- scripted ping watchdog ----------
+
+    def _tick_scripted_pings(self, mission_id: str, now: int) -> None:
+        for sp in db.list_scripted_pings(self.conn, mission_id):
+            if sp["state"] != "active":
+                continue
+            last = sp["last_alive_at"] or 0
+            if now - int(last) <= int(sp["timeout_s"]):
+                continue
+            # Script went silent - mark broken (stops re-nagging) and ask the
+            # worker to repair it.
+            db.set_scripted_ping_state(self.conn, sp["id"], "broken")
+            directive = config.SCRIPTED_PING_REPAIR_DIRECTIVE.format(
+                spid=sp["id"], timeout_s=sp["timeout_s"],
+                condition=sp["condition"], script_path=sp["script_path"] or "(unknown)",
+            )
+            self._enqueue_oob(
+                mission_id, {"kind": "scripted_ping_repair", "directive": directive}
+            )
+            db.log_event(
+                self.conn, mission_id=mission_id, kind="scripted_ping_silent",
+                payload={"spid": sp["id"]},
             )
 
     # ---------- soft cancel ----------
@@ -283,6 +314,10 @@ class Engine:
         # even if the step queue is empty. Stay running until the host removes
         # them (ping.delete) or explicitly ends the mission (mission.cancel).
         if db.list_pings(self.conn, mission_id):
+            return
+        # Scripted pings keep the mission alive too - their watcher scripts run
+        # in the background and may fire at any time.
+        if db.list_scripted_pings(self.conn, mission_id):
             return
 
         # Reply-driven sessions: the worker already answered the user via notify,

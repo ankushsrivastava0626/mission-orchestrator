@@ -562,6 +562,99 @@ def h_ping_delete(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True}
 
 
+# --- scripted pings (autonomous watcher scripts) ---
+
+
+def _sping_or_raise(d: Daemon, spid: str) -> Any:
+    row = db.get_scripted_ping(d.conn, spid)
+    if row is None:
+        raise RPCError("not_found", f"no scripted ping {spid}")
+    return row
+
+
+def h_scripted_ping_add(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    mission_id, condition, action = _require(p, "mission_id", "condition", "action")
+    _mission_or_raise(d.conn, mission_id)
+    timeout_s = int(p.get("timeout_s") or 600)
+    if timeout_s < 30:
+        raise RPCError("bad_timeout", "timeout_s must be >= 30")
+    created_by = p.get("created_by", "host")
+    spid = db.add_scripted_ping(
+        d.conn, mission_id=mission_id, condition=condition, action=action,
+        timeout_s=timeout_s, created_by=created_by,
+    )
+    # Inject the setup directive so the worker writes & tests the watcher script.
+    directive = config.SCRIPTED_PING_SETUP_DIRECTIVE.format(
+        spid=spid, condition=condition, action=action,
+        timeout_s=timeout_s, half_timeout=max(10, timeout_s // 2),
+    )
+    d.engine._enqueue_oob(
+        mission_id, {"kind": "scripted_ping_setup", "directive": directive}
+    )
+    db.log_event(
+        d.conn, mission_id=mission_id, kind="scripted_ping_added",
+        payload={"spid": spid, "timeout_s": timeout_s},
+    )
+    return {"scripted_ping_id": spid}
+
+
+def h_scripted_ping_list(d: Daemon, p: dict[str, Any]) -> list[dict[str, Any]]:
+    (mission_id,) = _require(p, "mission_id")
+    return db.rows_to_dicts(db.list_scripted_pings(d.conn, mission_id))
+
+
+def h_scripted_ping_delete(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    (spid,) = _require(p, "scripted_ping_id")
+    _sping_or_raise(d, spid)
+    db.delete_scripted_ping(d.conn, spid)
+    return {"ok": True}
+
+
+def h_scripted_ping_alive(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Heartbeat from a running watcher script (via the owatch CLI)."""
+    (spid,) = _require(p, "scripted_ping_id")
+    sp = _sping_or_raise(d, spid)
+    db.touch_scripted_ping_alive(d.conn, spid)
+    # An alive signal from a previously-broken script means it recovered.
+    if sp["state"] == "broken":
+        db.set_scripted_ping_state(d.conn, spid, "active")
+    return {"ok": True}
+
+
+def h_scripted_ping_ready(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Worker signals the script is tested and running."""
+    (spid,) = _require(p, "scripted_ping_id")
+    sp = _sping_or_raise(d, spid)
+    script_path = p.get("script_path")
+    db.set_scripted_ping_state(
+        d.conn, spid, "active", script_path=script_path, touch_alive=True
+    )
+    db.log_event(
+        d.conn, mission_id=sp["mission_id"], kind="scripted_ping_ready",
+        payload={"spid": spid, "script_path": script_path},
+    )
+    return {"ok": True}
+
+
+def h_scripted_ping_fire(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """The watcher script reports its condition became true."""
+    (spid,) = _require(p, "scripted_ping_id")
+    sp = _sping_or_raise(d, spid)
+    db.touch_scripted_ping_alive(d.conn, spid)
+    context = str(p.get("context") or "(none)")
+    directive = config.SCRIPTED_PING_FIRE_DIRECTIVE.format(
+        condition=sp["condition"], action=sp["action"], context=context,
+    )
+    d.engine._enqueue_oob(
+        sp["mission_id"], {"kind": "scripted_ping_fire", "directive": directive}
+    )
+    db.log_event(
+        d.conn, mission_id=sp["mission_id"], kind="scripted_ping_fired",
+        payload={"spid": spid, "context": context[:200]},
+    )
+    return {"ok": True}
+
+
 # --- heartbeat ---
 
 
@@ -758,6 +851,12 @@ _HANDLERS: dict[str, Handler] = {
     "step.update": h_step_update,
     "step.delete": h_step_delete,
     "step.cancel_current": h_step_cancel_current,
+    "scripted_ping.add": h_scripted_ping_add,
+    "scripted_ping.list": h_scripted_ping_list,
+    "scripted_ping.delete": h_scripted_ping_delete,
+    "scripted_ping.alive": h_scripted_ping_alive,
+    "scripted_ping.ready": h_scripted_ping_ready,
+    "scripted_ping.fire": h_scripted_ping_fire,
     "ping.add": h_ping_add,
     "ping.list": h_ping_list,
     "ping.update": h_ping_update,

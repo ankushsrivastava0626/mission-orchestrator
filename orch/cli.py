@@ -191,5 +191,63 @@ def msec_main() -> None:
     msec_cli()
 
 
+# ---------- owatch (scripted-ping callbacks, used by watcher scripts) ----------
+
+
+@click.group()
+def owatch_cli() -> None:
+    """Scripted-ping callback tool, called by autonomous watcher scripts."""
+
+
+@owatch_cli.command("alive")
+@click.argument("scripted_ping_id")
+def owatch_alive(scripted_ping_id: str) -> None:
+    """Heartbeat - prove the watcher script is still running."""
+    try:
+        with client.DaemonClient() as c:
+            c.call("scripted_ping.alive", {"scripted_ping_id": scripted_ping_id, "caller": "owatch"})
+    except client.DaemonError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+    click.echo("ok")
+
+
+@owatch_cli.command("fire")
+@click.argument("scripted_ping_id")
+@click.argument("context", required=False, default="")
+def owatch_fire(scripted_ping_id: str, context: str) -> None:
+    """Condition met - wake the worker to send the notify."""
+    try:
+        with client.DaemonClient() as c:
+            c.call("scripted_ping.fire", {
+                "scripted_ping_id": scripted_ping_id, "context": context, "caller": "owatch",
+            })
+    except client.DaemonError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+    click.echo("fired")
+
+
+@owatch_cli.command("ready")
+@click.argument("scripted_ping_id")
+@click.argument("script_path", required=False, default=None)
+def owatch_ready(scripted_ping_id: str, script_path: str | None) -> None:
+    """Register the script as tested and running (activates the watchdog)."""
+    try:
+        with client.DaemonClient() as c:
+            c.call("scripted_ping.ready", {
+                "scripted_ping_id": scripted_ping_id, "script_path": script_path,
+                "caller": "owatch",
+            })
+    except client.DaemonError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+    click.echo("ready")
+
+
+def owatch_main() -> None:
+    owatch_cli()
+
+
 if __name__ == "__main__":  # pragma: no cover
     daemon_main()

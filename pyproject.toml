@@ -13,6 +13,7 @@ orchd = "orch.cli:daemon_main"
 orchctl = "orch.cli:ctl_main"
 orch-mcp = "orch.mcp_server:main"
 msec = "orch.cli:msec_main"
+owatch = "orch.cli:owatch_main"
 
 [build-system]
 requires = ["setuptools>=64"]
