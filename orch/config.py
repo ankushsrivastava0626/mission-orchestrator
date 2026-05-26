@@ -12,6 +12,7 @@ DB_PATH = ORCH_DIR / "orch.db"
 SOCKET_PATH = ORCH_DIR / "orchd.sock"
 
 PASSWORD_STORE_DIR = HOME / ".password-store"
+MAILBOX_DIR = ORCH_DIR / "mailbox"  # worker -> host file attachments
 
 # Extra MCP servers merged into every worker's .mcp.json (e.g. Playwright).
 # JSON with an "mcpServers" object; '{mission_id}' is substituted in values.

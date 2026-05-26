@@ -179,6 +179,44 @@ Terminal mission states are required before mission.delete will succeed.
 
 HOST_TOOLS: list[Tool] = [
     Tool(
+        name="host.inbox",
+        description=(
+            "Read messages workers have sent up to you (the host) via their message_host tool. "
+            "This is a PULL mailbox - workers can't interrupt you, so call this to see what they've "
+            "said (escalations, questions, structured status, file deliveries). Poll it on your own "
+            "cadence (e.g. each loop, or when the user asks you to check).\n\n"
+            "Args: {include_acked? (default false), limit? (default 50)}.\n\n"
+            "Returns: array of {message_id, mission_id, ts, text, acked, files:[{file_id, name, "
+            "size}]}. Fetch a file's bytes with host.fetch_file(file_id). Mark handled with "
+            "host.ack(message_id)."
+        ),
+        inputSchema=_obj(
+            {
+                "include_acked": {"type": "boolean"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 200},
+            },
+            [],
+        ),
+    ),
+    Tool(
+        name="host.ack",
+        description=(
+            "Mark a worker→host message as handled so it stops showing in host.inbox. Also frees "
+            "its attached files.\n\nArgs: {message_id (required)}.\nReturns: {ok: true}."
+        ),
+        inputSchema=_obj({"message_id": {"type": "string"}}, ["message_id"]),
+    ),
+    Tool(
+        name="host.fetch_file",
+        description=(
+            "Fetch the bytes of a file a worker attached to a host message, base64-encoded (works "
+            "across SSH). Decode and save it on your side.\n\n"
+            "Args: {file_id (required)} - from host.inbox files[].file_id, format '<message_id>:<index>'.\n\n"
+            "Returns: {name, size, base64}. Files over 25MB are rejected (fetch them another way)."
+        ),
+        inputSchema=_obj({"file_id": {"type": "string"}}, ["file_id"]),
+    ),
+    Tool(
         name="defaults.get",
         description=(
             "Read daemon-wide defaults.\n\n"
@@ -682,6 +720,29 @@ def _worker_tools() -> list[Tool]:
             inputSchema=_obj({"text": {"type": "string"}}, ["text"]),
         ),
         Tool(
+            name="message_host",
+            description=(
+                "Send a message UP to the orchestrating host (not the human user). Use this to "
+                "escalate a blocker, ask the host to spawn a follow-up mission, hand back "
+                "structured results, or deliver files. The host reads these from its inbox on its "
+                "own schedule (it's a mailbox, not an interrupt). For messages meant for the human, "
+                "use `notify` instead.\n\n"
+                "Args:\n"
+                "  text (required): your message to the host.\n"
+                "  files (optional): list of absolute file paths on this machine to attach; the "
+                "daemon copies them so the host can fetch their bytes.\n\n"
+                "Example: {text: \"Scrape done, results attached. Want me to start the analysis "
+                "mission?\", files: [\"/tmp/results.json\"]}"
+            ),
+            inputSchema=_obj(
+                {
+                    "text": {"type": "string"},
+                    "files": {"type": "array", "items": {"type": "string"}},
+                },
+                ["text"],
+            ),
+        ),
+        Tool(
             name="queue.list",
             description="List the mission's steps (current and pending).",
             inputSchema=_obj({}, []),
@@ -778,6 +839,12 @@ def build_worker_server(mission_id: str) -> Server:
         a = {**args, "mission_id": mission_id, "caller": "worker"}
         if name == "notify":
             return _text(_call("notify", {"mission_id": mission_id, "text": args.get("text", "")}))
+        if name == "message_host":
+            return _text(_call("host.message", {
+                "mission_id": mission_id,
+                "text": args.get("text", ""),
+                "files": args.get("files", []),
+            }))
         if name == "queue.list":
             return _text(_call("step.list", {"mission_id": mission_id}))
         if name == "queue.add":

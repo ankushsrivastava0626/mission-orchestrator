@@ -826,6 +826,98 @@ def h_notify(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True}
 
 
+def h_host_message(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Worker -> host mailbox. Optional file paths are copied into the mailbox
+    store so the host can fetch their bytes later (works across SSH)."""
+    mission_id, text = _require(p, "mission_id", "text")
+    file_paths = p.get("files") or []
+    if isinstance(file_paths, str):
+        file_paths = [file_paths]
+    mid = db.new_id()
+    stored: list[dict[str, Any]] = []
+    if file_paths:
+        import shutil
+        dest_dir = config.MAILBOX_DIR / mid
+        dest_dir.mkdir(parents=True, exist_ok=True)
+        for fp in file_paths:
+            src = os.path.expanduser(str(fp))
+            if not os.path.isfile(src):
+                stored.append({"name": os.path.basename(src), "error": "not found", "path": src})
+                continue
+            name = os.path.basename(src) or "file"
+            dest = dest_dir / name
+            try:
+                shutil.copy2(src, dest)
+                stored.append({"name": name, "path": str(dest), "size": os.path.getsize(dest)})
+            except Exception as e:
+                stored.append({"name": name, "error": str(e), "path": src})
+    # Reuse the generated id as the row id for tidy file_id mapping.
+    d.conn.execute(
+        "INSERT INTO host_messages (id, mission_id, text, files, created_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (mid, mission_id, str(text), json.dumps(stored), db.now_ts()),
+    )
+    db.log_event(
+        d.conn, mission_id=mission_id, kind="host_message_sent",
+        payload={"message_id": mid, "files": len(stored)},
+    )
+    return {"ok": True, "message_id": mid, "files": len(stored)}
+
+
+def h_host_inbox(d: Daemon, p: dict[str, Any]) -> list[dict[str, Any]]:
+    """Host reads pending worker messages. file_id = <message_id>:<index>."""
+    include_acked = bool(p.get("include_acked", False))
+    limit = int(p.get("limit") or 50)
+    rows = db.list_host_messages(d.conn, include_acked=include_acked, limit=limit)
+    out = []
+    for r in rows:
+        files = json.loads(r["files"] or "[]")
+        file_meta = [
+            {"file_id": f"{r['id']}:{i}", "name": f.get("name"),
+             "size": f.get("size"), "error": f.get("error")}
+            for i, f in enumerate(files)
+        ]
+        out.append({
+            "message_id": r["id"], "mission_id": r["mission_id"],
+            "ts": r["created_at"], "text": r["text"],
+            "acked": bool(r["acked"]), "files": file_meta,
+        })
+    return out
+
+
+def h_host_ack(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    (message_id,) = _require(p, "message_id")
+    db.ack_host_message(d.conn, message_id)
+    return {"ok": True}
+
+
+def h_host_fetch_file(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Return a mailbox file's bytes (base64) so a remote host can save it."""
+    import base64
+    (file_id,) = _require(p, "file_id")
+    try:
+        msg_id, idx_s = str(file_id).rsplit(":", 1)
+        idx = int(idx_s)
+    except ValueError:
+        raise RPCError("bad_file_id", "file_id must be '<message_id>:<index>'")
+    row = db.get_host_message(d.conn, msg_id)
+    if row is None:
+        raise RPCError("not_found", "no such message")
+    files = json.loads(row["files"] or "[]")
+    if idx < 0 or idx >= len(files):
+        raise RPCError("not_found", "no such file index")
+    f = files[idx]
+    path = f.get("path")
+    if not path or not os.path.isfile(path):
+        raise RPCError("gone", "file no longer available")
+    size = os.path.getsize(path)
+    if size > 25 * 1024 * 1024:
+        raise RPCError("too_large", f"file is {size} bytes; > 25MB inline limit")
+    with open(path, "rb") as fh:
+        b64 = base64.b64encode(fh.read()).decode("ascii")
+    return {"name": f.get("name"), "size": size, "base64": b64}
+
+
 def h_defaults_get(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     return {
         "default_chat_id": config.default_chat_id(),
@@ -838,6 +930,10 @@ def h_defaults_get(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
 _HANDLERS: dict[str, Handler] = {
     "defaults.get": h_defaults_get,
     "notify": h_notify,
+    "host.message": h_host_message,
+    "host.inbox": h_host_inbox,
+    "host.ack": h_host_ack,
+    "host.fetch_file": h_host_fetch_file,
     "mission.create": h_mission_create,
     "mission.list": h_mission_list,
     "mission.get": h_mission_get,

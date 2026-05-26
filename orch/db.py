@@ -60,6 +60,14 @@ CREATE TABLE IF NOT EXISTS notify_map (
   mission_id TEXT NOT NULL,
   ts INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS host_messages (
+  id TEXT PRIMARY KEY,
+  mission_id TEXT NOT NULL,
+  text TEXT,
+  files TEXT,                     -- json array of {name, path, size}
+  created_at INTEGER NOT NULL,
+  acked INTEGER NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS scripted_pings (
   id TEXT PRIMARY KEY,
   mission_id TEXT NOT NULL REFERENCES missions(id) ON DELETE CASCADE,
@@ -416,6 +424,36 @@ def touch_scripted_ping_alive(conn: sqlite3.Connection, spid: str) -> None:
     conn.execute(
         "UPDATE scripted_pings SET last_alive_at = ? WHERE id = ?", (now_ts(), spid)
     )
+
+
+def add_host_message(
+    conn: sqlite3.Connection, *, mission_id: str, text: str, files: list[dict],
+) -> str:
+    mid = new_id()
+    conn.execute(
+        "INSERT INTO host_messages (id, mission_id, text, files, created_at)"
+        " VALUES (?, ?, ?, ?, ?)",
+        (mid, mission_id, text, json.dumps(files), now_ts()),
+    )
+    return mid
+
+
+def list_host_messages(
+    conn: sqlite3.Connection, include_acked: bool = False, limit: int = 50,
+) -> list[sqlite3.Row]:
+    q = "SELECT * FROM host_messages"
+    if not include_acked:
+        q += " WHERE acked = 0"
+    q += " ORDER BY created_at ASC LIMIT ?"
+    return conn.execute(q, (int(limit),)).fetchall()
+
+
+def get_host_message(conn: sqlite3.Connection, mid: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM host_messages WHERE id = ?", (mid,)).fetchone()
+
+
+def ack_host_message(conn: sqlite3.Connection, mid: str) -> None:
+    conn.execute("UPDATE host_messages SET acked = 1 WHERE id = ?", (mid,))
 
 
 def session_started(conn: sqlite3.Connection, mission_id: str) -> bool:
