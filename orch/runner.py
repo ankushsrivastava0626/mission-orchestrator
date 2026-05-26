@@ -124,24 +124,57 @@ def tmux_pane_pid(session: str) -> int | None:
 # ---------- worker MCP config ----------
 
 
+def _load_extra_worker_mcps(mission_id: str) -> dict:
+    """Merge in extra MCP servers shared by all workers from EXTRA_WORKER_MCPS
+    (default /etc/orch/worker_mcp.json). The string '{mission_id}' is
+    substituted in any args/env values so each worker can get its own paths
+    (e.g. a per-mission Playwright browser profile). 'orch' is reserved."""
+    path = config.EXTRA_WORKER_MCPS_PATH
+    if not path.exists():
+        return {}
+    try:
+        raw = json.loads(path.read_text())
+    except Exception as e:
+        log.warning("extra worker MCPs: failed to read %s: %s", path, e)
+        return {}
+    servers = raw.get("mcpServers", raw)  # accept either {mcpServers:{..}} or {..}
+    if not isinstance(servers, dict):
+        return {}
+
+    def _sub(v):
+        if isinstance(v, str):
+            return v.replace("{mission_id}", mission_id)
+        if isinstance(v, list):
+            return [_sub(x) for x in v]
+        if isinstance(v, dict):
+            return {k: _sub(x) for k, x in v.items()}
+        return v
+
+    out = {}
+    for name, conf in servers.items():
+        if name == "orch":
+            continue
+        out[name] = _sub(conf)
+    return out
+
+
 def write_worker_mcp_config(mission_id: str) -> Path:
     tmp = config.worker_tmpdir(mission_id)
     tmp.mkdir(parents=True, exist_ok=True)
     (tmp / "cookies").mkdir(parents=True, exist_ok=True)
     cfg = tmp / ".mcp.json"
-    payload = {
-        "mcpServers": {
-            "orch": {
-                "command": "orch-mcp",
-                "args": ["--mode", "worker", "--mission-id", mission_id],
-                "env": {
-                    config.ENV_MISSION_ID: mission_id,
-                    config.ENV_SOCKET: str(config.SOCKET_PATH),
-                },
-            }
+    servers = {
+        "orch": {
+            "command": "orch-mcp",
+            "args": ["--mode", "worker", "--mission-id", mission_id],
+            "env": {
+                config.ENV_MISSION_ID: mission_id,
+                config.ENV_SOCKET: str(config.SOCKET_PATH),
+            },
         }
     }
-    cfg.write_text(json.dumps(payload, indent=2))
+    servers.update(_load_extra_worker_mcps(mission_id))
+    cfg.write_text(json.dumps({"mcpServers": servers}, indent=2))
     return cfg
 
 

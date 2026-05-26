@@ -13,6 +13,12 @@ SOCKET_PATH = ORCH_DIR / "orchd.sock"
 
 PASSWORD_STORE_DIR = HOME / ".password-store"
 
+# Extra MCP servers merged into every worker's .mcp.json (e.g. Playwright).
+# JSON with an "mcpServers" object; '{mission_id}' is substituted in values.
+EXTRA_WORKER_MCPS_PATH = Path(
+    os.environ.get("ORCH_EXTRA_WORKER_MCPS", "/etc/orch/worker_mcp.json")
+)
+
 TMUX_PREFIX = "mission-"
 WORKER_TMP_PREFIX = "/tmp/orch-"
 
