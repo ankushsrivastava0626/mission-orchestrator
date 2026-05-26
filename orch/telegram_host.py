@@ -118,6 +118,8 @@ class TelegramHost:
         # Sticky conversation: chat_id -> mission_id. A reply pins; plain text
         # then routes to the pinned mission until /unpin or a reply elsewhere.
         self._pinned: dict[str, str] = {}
+        # Live "typing…" keeper tasks, kept referenced so they aren't GC'd.
+        self._typing_tasks: set = set()
 
     def configured(self) -> bool:
         return bool(self.token and self.allowed)
@@ -295,15 +297,14 @@ class TelegramHost:
             "SELECT name FROM missions WHERE id = ?", (mid,)
         ).fetchone()
         name = row["name"] if row else sid
-        prompt_id = await self._send(
+        # Pin the conversation directly - no intermediate force_reply prompt.
+        # The user can now just type and every message routes to this mission.
+        self._pinned[chat_id] = mid
+        await self._send(
             client, chat_id,
-            f"💬 Reply to *{name}* - type your message and send it:",
-            force_reply=True,
+            f"💬 now talking to *{name}* - just type your message and it goes "
+            f"straight to it. Reply to another mission to switch, /unpin to stop.",
         )
-        if prompt_id is not None:
-            # Map the prompt message so the user's typed reply routes to this
-            # mission via the same path as replying to a worker notify message.
-            db.map_notify_message(self.daemon.conn, prompt_id, mid)
 
     async def _answer_cb(self, client: httpx.AsyncClient, cb_id: str) -> None:
         try:
@@ -314,21 +315,39 @@ class TelegramHost:
         except Exception:
             pass
 
-    async def _react(
-        self, client: httpx.AsyncClient, chat_id: str, msg_id: int | None,
-        emoji: str = "👀",
-    ) -> None:
-        if msg_id is None:
-            return
+    async def _send_typing(self, client: httpx.AsyncClient, chat_id: str) -> None:
         try:
             await client.post(
-                f"https://api.telegram.org/bot{self.token}/setMessageReaction",
-                json={"chat_id": chat_id, "message_id": msg_id,
-                      "reaction": [{"type": "emoji", "emoji": emoji}]},
-                timeout=5,
+                f"https://api.telegram.org/bot{self.token}/sendChatAction",
+                json={"chat_id": chat_id, "action": "typing"}, timeout=5,
             )
         except Exception:
             pass
+
+    def _start_typing(self, client: httpx.AsyncClient, chat_id: str, mission_id: str) -> None:
+        """Show 'typing…' in the chat until the worker emits its next notify."""
+        since = db.now_ts()
+        task = asyncio.create_task(self._typing_loop(client, chat_id, mission_id, since))
+        self._typing_tasks.add(task)
+        task.add_done_callback(self._typing_tasks.discard)
+
+    async def _typing_loop(
+        self, client: httpx.AsyncClient, chat_id: str, mission_id: str, since: int,
+    ) -> None:
+        # Telegram's typing action lasts ~5s; refresh it every 4s until the
+        # worker sends a notify (its reply) or we hit a safety timeout.
+        import time as _t
+        deadline = _t.time() + 240
+        while _t.time() < deadline:
+            await self._send_typing(client, chat_id)
+            await asyncio.sleep(4)
+            row = self.daemon.conn.execute(
+                "SELECT 1 FROM events WHERE mission_id = ? AND kind = 'notify_sent'"
+                " AND ts >= ? LIMIT 1",
+                (mission_id, since),
+            ).fetchone()
+            if row is not None:
+                return
 
     async def _dispatch_and_send(
         self, client: httpx.AsyncClient, chat_id: str,
@@ -415,14 +434,13 @@ class TelegramHost:
             db.log_event(
                 self.daemon.conn, mission_id=mission_id, kind="user_reply_routed",
             )
-            if continuing:
-                await self._react(client, chat_id, msg_id, "👀")
-            else:
+            if not continuing:
                 await self._send(
                     client, chat_id,
                     f"💬 now talking to *{m['name']}* - just type to continue (/unpin to stop).",
                     msg_id,
                 )
+            self._start_typing(client, chat_id, mission_id)
             return
         if state == "completed":
             # Reopen, run the reply as a one-shot, finalize silently afterward.
@@ -444,14 +462,13 @@ class TelegramHost:
             self.daemon.engine._enqueue_oob(
                 mission_id, {"kind": "user_reply", "directive": directive}
             )
-            if continuing:
-                await self._react(client, chat_id, msg_id, "👀")
-            else:
+            if not continuing:
                 await self._send(
                     client, chat_id,
                     f"💬 now talking to *{m['name']}* - just type to continue (/unpin to stop).",
                     msg_id,
                 )
+            self._start_typing(client, chat_id, mission_id)
             return
         # Terminal & non-reopenable (cancelled/failed): can't route.
         self._pinned.pop(chat_id, None)
