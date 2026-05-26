@@ -115,6 +115,9 @@ class TelegramHost:
         self._stop = asyncio.Event()
         self._offset = 0
         self._bot_username: str | None = None
+        # Sticky conversation: chat_id -> mission_id. A reply pins; plain text
+        # then routes to the pinned mission until /unpin or a reply elsewhere.
+        self._pinned: dict[str, str] = {}
 
     def configured(self) -> bool:
         return bool(self.token and self.allowed)
@@ -185,20 +188,51 @@ class TelegramHost:
                         chat_id,
                     )
                     continue
-                # If this is a reply to a worker's notify message, route the text
-                # to that worker instead of treating it as a /command.
+                text = msg["text"]
+                msg_id = msg.get("message_id")
+                # 1. Reply to a mapped worker/prompt message → route + pin the
+                #    conversation to that mission.
                 reply_to = msg.get("reply_to_message")
                 if reply_to is not None:
                     replied_mid = db.mission_for_notify(
                         self.daemon.conn, reply_to.get("message_id", -1)
                     )
                     if replied_mid is not None:
-                        await self._route_reply(
-                            client, chat_id, replied_mid, msg["text"],
-                            msg.get("message_id"),
-                        )
+                        await self._route_reply(client, chat_id, replied_mid, text, msg_id)
                         continue
-                await self._handle(client, chat_id, msg["text"], msg.get("message_id"))
+                # 2. Pin-management commands (need chat_id, handled inline).
+                low = text.strip().lower()
+                if low in ("/unpin", "/leave", "/exit"):
+                    if self._pinned.pop(chat_id, None):
+                        await self._send(client, chat_id, "📌 conversation unpinned. Plain messages won't route to a mission now.", msg_id)
+                    else:
+                        await self._send(client, chat_id, "no active conversation to unpin.", msg_id)
+                    continue
+                if low in ("/here", "/pinned"):
+                    pin = self._pinned.get(chat_id)
+                    if pin:
+                        row = self.daemon.conn.execute("SELECT name FROM missions WHERE id=?", (pin,)).fetchone()
+                        await self._send(client, chat_id, f"📌 pinned to *{row['name'] if row else pin[:8]}*. Plain messages go there; /unpin to stop.", msg_id)
+                    else:
+                        await self._send(client, chat_id, "no mission pinned. Reply to one (or tap 💬 reply) to start a conversation.", msg_id)
+                    continue
+                # 3. Other slash commands → normal command dispatch.
+                if text.strip().startswith("/"):
+                    await self._handle(client, chat_id, text, msg_id)
+                    continue
+                # 4. Plain text → route to the pinned mission (sticky conversation).
+                pinned = self._pinned.get(chat_id)
+                if pinned:
+                    await self._route_reply(client, chat_id, pinned, text, msg_id)
+                    continue
+                # 5. Nothing pinned: gently guide.
+                await self._send(
+                    client, chat_id,
+                    "No active conversation. Reply to a mission's message (or tap 💬 reply on its "
+                    "detail) to start one - after that, just type and it keeps going to that mission. "
+                    "Use /missions to browse.",
+                    msg_id,
+                )
             elif "callback_query" in update:
                 cq = update["callback_query"]
                 chat_id = str(cq["message"]["chat"]["id"])
@@ -343,14 +377,17 @@ class TelegramHost:
             "SELECT * FROM missions WHERE id = ?", (mission_id,)
         ).fetchone()
         if m is None:
-            await self._send(client, chat_id, "❌ that mission no longer exists", msg_id)
+            self._pinned.pop(chat_id, None)
+            await self._send(client, chat_id, "❌ that mission no longer exists (conversation unpinned)", msg_id)
             return
         state = m["state"]
         directive = (
-            f"[The user replied to your Telegram message]: {text}\n\n"
-            f"Act on this, then reply to the user via the `notify` tool with your response."
+            f"[The user is in a Telegram conversation with you and said]: {text}\n\n"
+            f"Act on this, then reply to the user via the `notify` tool with your response. "
+            f"They may keep the conversation going, so be ready for follow-ups."
         )
         if state == "running" or state == "cancelling":
+            self._pinned[chat_id] = mission_id
             self.daemon.engine._enqueue_oob(
                 mission_id, {"kind": "user_reply", "directive": directive}
             )
@@ -359,7 +396,9 @@ class TelegramHost:
             )
             await self._send(
                 client, chat_id,
-                f"➡️ routed to *{m['name']}* - it'll reply here shortly.", msg_id,
+                f"➡️ sent to *{m['name']}*.\n"
+                f"💬 now talking to it - just type to continue (/unpin to stop).",
+                msg_id,
             )
             return
         if state == "completed":
@@ -378,18 +417,22 @@ class TelegramHost:
             db.log_event(self.daemon.conn, mission_id=mission_id, kind="mission_reopened")
             db.log_event(self.daemon.conn, mission_id=mission_id, kind="user_reply_routed")
             self.daemon.engine._suppress_wrapup.add(mission_id)
+            self._pinned[chat_id] = mission_id
             self.daemon.engine._enqueue_oob(
                 mission_id, {"kind": "user_reply", "directive": directive}
             )
             await self._send(
                 client, chat_id,
-                f"➡️ reopened *{m['name']}* and routed your reply - it'll respond here.",
+                f"➡️ reopened *{m['name']}* and sent your message.\n"
+                f"💬 now talking to it - just type to continue (/unpin to stop).",
                 msg_id,
             )
             return
+        # Terminal & non-reopenable (cancelled/failed): can't route.
+        self._pinned.pop(chat_id, None)
         await self._send(
             client, chat_id,
-            f"❌ mission *{m['name']}* is {state}; can't route a reply to it.",
+            f"❌ mission *{m['name']}* is {state}; can't route a message to it (conversation unpinned).",
             msg_id,
         )
 
@@ -478,7 +521,13 @@ def _cmd_helptext(self: TelegramHost, args: list[str]) -> str:
         "`/events <id>` - recent audit events\n"
         "`/secret <id> <name> <value>` - store a secret\n"
         "`/heartbeat <id> <seconds>` - set heartbeat\n"
+        "`/unpin` - leave the current conversation\n"
+        "`/here` - show which mission you're talking to\n"
         "`/help` - main menu\n\n"
+        "💬 *Conversation mode*: reply to any mission's message (or tap 💬 reply) "
+        "to pin it - after that, just type normally and every message goes to "
+        "that mission, like a chat. Reply to a different mission to switch. "
+        "`/unpin` to stop.\n\n"
         "Mission ids accept unambiguous prefixes (e.g. `c3b4` for "
         "`c3b4f684-...`) or exact mission names."
     )
