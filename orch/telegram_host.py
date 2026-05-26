@@ -314,6 +314,22 @@ class TelegramHost:
         except Exception:
             pass
 
+    async def _react(
+        self, client: httpx.AsyncClient, chat_id: str, msg_id: int | None,
+        emoji: str = "👀",
+    ) -> None:
+        if msg_id is None:
+            return
+        try:
+            await client.post(
+                f"https://api.telegram.org/bot{self.token}/setMessageReaction",
+                json={"chat_id": chat_id, "message_id": msg_id,
+                      "reaction": [{"type": "emoji", "emoji": emoji}]},
+                timeout=5,
+            )
+        except Exception:
+            pass
+
     async def _dispatch_and_send(
         self, client: httpx.AsyncClient, chat_id: str,
         cmd: str, args: list[str], reply_to: int | None = None,
@@ -381,6 +397,11 @@ class TelegramHost:
             await self._send(client, chat_id, "❌ that mission no longer exists (conversation unpinned)", msg_id)
             return
         state = m["state"]
+        # "Continuing" = this chat is already pinned to this mission. In that
+        # case we route silently (a 👀 reaction, no banner) - the worker's own
+        # notify reply is the response. The banner only shows when the pin is
+        # newly set or switched.
+        continuing = self._pinned.get(chat_id) == mission_id
         directive = (
             f"[The user is in a Telegram conversation with you and said]: {text}\n\n"
             f"Act on this, then reply to the user via the `notify` tool with your response. "
@@ -394,12 +415,14 @@ class TelegramHost:
             db.log_event(
                 self.daemon.conn, mission_id=mission_id, kind="user_reply_routed",
             )
-            await self._send(
-                client, chat_id,
-                f"➡️ sent to *{m['name']}*.\n"
-                f"💬 now talking to it - just type to continue (/unpin to stop).",
-                msg_id,
-            )
+            if continuing:
+                await self._react(client, chat_id, msg_id, "👀")
+            else:
+                await self._send(
+                    client, chat_id,
+                    f"💬 now talking to *{m['name']}* - just type to continue (/unpin to stop).",
+                    msg_id,
+                )
             return
         if state == "completed":
             # Reopen, run the reply as a one-shot, finalize silently afterward.
@@ -421,12 +444,14 @@ class TelegramHost:
             self.daemon.engine._enqueue_oob(
                 mission_id, {"kind": "user_reply", "directive": directive}
             )
-            await self._send(
-                client, chat_id,
-                f"➡️ reopened *{m['name']}* and sent your message.\n"
-                f"💬 now talking to it - just type to continue (/unpin to stop).",
-                msg_id,
-            )
+            if continuing:
+                await self._react(client, chat_id, msg_id, "👀")
+            else:
+                await self._send(
+                    client, chat_id,
+                    f"💬 now talking to *{m['name']}* - just type to continue (/unpin to stop).",
+                    msg_id,
+                )
             return
         # Terminal & non-reopenable (cancelled/failed): can't route.
         self._pinned.pop(chat_id, None)
