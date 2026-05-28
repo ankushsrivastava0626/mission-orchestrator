@@ -148,6 +148,10 @@ Secrets & Cookies
 
 Inside the tmux, the worker has its own (scoped) MCP server with these tools:
   notify(text)                - message the human USER over Telegram (user-facing)
+  talk_to_user(summary, q?)   - PHONE the user (via the J-dawg voice agent) for a
+                                genuine decision/blocker. Non-blocking: the worker
+                                finishes its turn; the user's spoken decision comes
+                                back as a NEW step (step.add) in the same mission.
   message_host(text, files?)  - message YOU (the host) up the mailbox; can attach
                                 files. You read these via host.inbox / host.fetch_file
                                 / host.ack. Workers use this to escalate, ask you to
@@ -162,14 +166,17 @@ configured for all workers (e.g. Playwright for browser automation), run with
 --dangerously-skip-permissions.
 
 So the worker can extend its own plan, add follow-ups, stop posting pings, browse
-the web, and push messages/files up to you. It cannot create other missions,
-change Telegram destinations, or silence its own heartbeat.
+the web, phone the user, and push messages/files up to you. It cannot create
+other missions, change Telegram destinations, or silence its own heartbeat.
 
-Two distinct upward channels - keep them straight:
-  notify       → the human user (Telegram). Use for things the user should see.
-  message_host → you, the orchestrator (mailbox). Use for coordination/escalation
-                 between worker and host. Workers pick which based on audience;
-                 remember to poll host.inbox to receive the message_host ones.
+Three upward channels - keep them straight (the worker picks by audience+urgency):
+  notify       → the human user, async text (Telegram). Routine updates/results.
+  talk_to_user → the human user, live PHONE call. Only for real decisions/blockers
+                 needing a human now; the answer returns as a new step automatically.
+  message_host → you, the orchestrator (mailbox). Coordination/escalation between
+                 worker and host. Poll host.inbox to receive these.
+(The extra worker MCPs like Playwright and talk_to_user are configured in
+/etc/orch/worker_mcp.json and may change; this list reflects the current set.)
 
 ============================  STATE MACHINES  ============================
 
