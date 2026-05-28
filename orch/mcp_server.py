@@ -171,10 +171,15 @@ other missions, change Telegram destinations, or silence its own heartbeat.
 
 Three upward channels - keep them straight (the worker picks by audience+urgency):
   notify       → the human user, async text (Telegram). Routine updates/results.
-  talk_to_user → the human user, live PHONE call. Only for real decisions/blockers
-                 needing a human now; the answer returns as a new step automatically.
+  talk_to_user → the human user, live PHONE call. For real decisions/blockers AND
+                 as an URGENT-ESCALATION path: imminent deadline, time-critical
+                 yes/no, or a notify went unanswered and still needs the user. A
+                 phone rings; a Telegram text can sit unread. The answer returns as
+                 a new step automatically.
   message_host → you, the orchestrator (mailbox). Coordination/escalation between
                  worker and host. Poll host.inbox to receive these.
+Escalation ladder for the user: notify (async) → talk_to_user (call) when it's
+time-critical or the text went unanswered.
 (The extra worker MCPs like Playwright and talk_to_user are configured in
 /etc/orch/worker_mcp.json and may change; this list reflects the current set.)
 
