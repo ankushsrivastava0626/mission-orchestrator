@@ -147,15 +147,29 @@ Secrets & Cookies
 =========================  WORKER CAPABILITIES  =========================
 
 Inside the tmux, the worker has its own (scoped) MCP server with these tools:
-  notify(text)                - send a Telegram message (the ONLY user-facing channel)
+  notify(text)                - message the human USER over Telegram (user-facing)
+  message_host(text, files?)  - message YOU (the host) up the mailbox; can attach
+                                files. You read these via host.inbox / host.fetch_file
+                                / host.ack. Workers use this to escalate, ask you to
+                                spawn follow-up missions, or hand back results+files.
   queue.list/add/update/delete - recursively manage its own pending steps
   pings.list/add/delete       - manage its own watcher pings (scripted)
   mission.status              - read its own mission row
   secrets.list / cookies.list - names only (values via the `msec` CLI)
 
-So the worker can extend its own plan, add follow-ups, or stop posting pings.
-It cannot create other missions, change Telegram destinations, or silence its
-own heartbeat.
+Plus full Claude Code tooling (Bash, Read/Write, web) and any extra MCP servers
+configured for all workers (e.g. Playwright for browser automation), run with
+--dangerously-skip-permissions.
+
+So the worker can extend its own plan, add follow-ups, stop posting pings, browse
+the web, and push messages/files up to you. It cannot create other missions,
+change Telegram destinations, or silence its own heartbeat.
+
+Two distinct upward channels - keep them straight:
+  notify       → the human user (Telegram). Use for things the user should see.
+  message_host → you, the orchestrator (mailbox). Use for coordination/escalation
+                 between worker and host. Workers pick which based on audience;
+                 remember to poll host.inbox to receive the message_host ones.
 
 ============================  STATE MACHINES  ============================
 
