@@ -319,6 +319,12 @@ class Engine:
         # in the background and may fire at any time.
         if db.list_scripted_pings(self.conn, mission_id):
             return
+        # Hold: the worker escalated (e.g. talk_to_user) and is awaiting an
+        # async answer that will arrive as a new step. Stay alive until the hold
+        # expires so the answer has a live session to land in.
+        hold_until = int(m["hold_until"] or 0)
+        if hold_until and now < hold_until:
+            return
 
         # Reply-driven sessions: the worker already answered the user via notify,
         # so skip the wrap-up summary and finalize silently.

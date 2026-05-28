@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS missions (
   created_at INTEGER NOT NULL,
   finished_at INTEGER,
   restart_count INTEGER NOT NULL DEFAULT 0,
-  last_heartbeat_at INTEGER
+  last_heartbeat_at INTEGER,
+  hold_until INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS steps (
   id TEXT PRIMARY KEY,
@@ -106,6 +107,20 @@ def connect(path: Path | None = None) -> sqlite3.Connection:
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
+    # Lightweight migrations for DBs created before a column existed.
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(missions)")}
+    if "hold_until" not in cols:
+        conn.execute("ALTER TABLE missions ADD COLUMN hold_until INTEGER NOT NULL DEFAULT 0")
+
+
+def set_mission_hold(conn: sqlite3.Connection, mission_id: str, until_ts: int) -> None:
+    conn.execute(
+        "UPDATE missions SET hold_until = ? WHERE id = ?", (int(until_ts), mission_id)
+    )
+
+
+def clear_mission_hold(conn: sqlite3.Connection, mission_id: str) -> None:
+    conn.execute("UPDATE missions SET hold_until = 0 WHERE id = ?", (mission_id,))
 
 
 def map_notify_message(conn: sqlite3.Connection, message_id: int, mission_id: str) -> None:

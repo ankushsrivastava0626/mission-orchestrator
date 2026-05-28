@@ -467,6 +467,9 @@ def h_step_add(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
         position=int(position),
     )
     db.log_event(d.conn, mission_id=mission_id, kind="step_added", step_id=sid)
+    # A new step means awaited work/answers arrived - release any hold so the
+    # mission resumes normal completion logic after this step runs.
+    db.clear_mission_hold(d.conn, mission_id)
     return {"step_id": sid}
 
 
@@ -826,6 +829,27 @@ def h_notify(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True}
 
 
+def h_mission_hold(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Hold a mission open (suppress auto-complete) for `seconds`, because it is
+    awaiting an async answer that will arrive as a new step. Default 3600s,
+    max 86400s. seconds<=0 clears the hold."""
+    (mission_id,) = _require(p, "mission_id")
+    _mission_or_raise(d.conn, mission_id)
+    seconds = int(p.get("seconds", 3600))
+    if seconds <= 0:
+        db.clear_mission_hold(d.conn, mission_id)
+        return {"ok": True, "held": False}
+    if seconds > 86400:
+        seconds = 86400
+    until = db.now_ts() + seconds
+    db.set_mission_hold(d.conn, mission_id, until)
+    db.log_event(
+        d.conn, mission_id=mission_id, kind="mission_held",
+        payload={"seconds": seconds, "reason": p.get("reason")},
+    )
+    return {"ok": True, "held": True, "until": until}
+
+
 def h_host_message(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     """Worker -> host mailbox. Optional file paths are copied into the mailbox
     store so the host can fetch their bytes later (works across SSH)."""
@@ -930,6 +954,7 @@ def h_defaults_get(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
 _HANDLERS: dict[str, Handler] = {
     "defaults.get": h_defaults_get,
     "notify": h_notify,
+    "mission.hold": h_mission_hold,
     "host.message": h_host_message,
     "host.inbox": h_host_inbox,
     "host.ack": h_host_ack,
