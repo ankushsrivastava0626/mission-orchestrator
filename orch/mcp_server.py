@@ -35,7 +35,17 @@ def _call(method: str, params: dict[str, Any]) -> Any:
 
 _CUE_SCHEMA: dict[str, Any] = {
     "type": "object",
-    "description": "Entry condition for a step",
+    "description": (
+        "Entry condition for a step. Types:\n"
+        "  immediate                    - fire now (first step only)\n"
+        "  on_prev_complete             - when the previous step finishes\n"
+        "  on_prev_complete_or_timeout  - prev finishes OR `seconds` since prev started\n"
+        "  on_timeout                   - `seconds` after prev started, regardless of completion\n"
+        "  at_time                      - at an absolute wall-clock time; give `at` "
+        "(local datetime 'YYYY-MM-DD HH:MM', machine timezone) or `epoch` (unix seconds). "
+        "Fires once that time passes and the worker is idle; if the time is already "
+        "past when queued, fires as soon as the worker is idle."
+    ),
     "properties": {
         "type": {
             "type": "string",
@@ -44,9 +54,12 @@ _CUE_SCHEMA: dict[str, Any] = {
                 "on_prev_complete",
                 "on_prev_complete_or_timeout",
                 "on_timeout",
+                "at_time",
             ],
         },
-        "seconds": {"type": "integer", "minimum": 1},
+        "seconds": {"type": "integer", "minimum": 1, "description": "For the *_timeout cues."},
+        "at": {"type": "string", "description": "For at_time: local datetime 'YYYY-MM-DD HH:MM'."},
+        "epoch": {"type": "integer", "description": "For at_time: absolute unix seconds (alternative to `at`)."},
     },
     "required": ["type"],
 }
@@ -96,6 +109,9 @@ Cue (entry condition for a step)
   {"type": "on_prev_complete"}                          - wait until previous step finishes
   {"type": "on_prev_complete_or_timeout", "seconds": N} - whichever happens first
   {"type": "on_timeout", "seconds": N}                  - fire N seconds after previous step started, regardless
+  {"type": "at_time", "at": "YYYY-MM-DD HH:MM"}         - fire at an absolute wall-clock time (machine tz);
+                                                          or {"type": "at_time", "epoch": <unix seconds>}.
+                                                          Past times fire as soon as the worker is idle.
 
 Heartbeat
   Exactly one per mission. MANDATORY. Default 24h (86400s), max 24h. Cannot

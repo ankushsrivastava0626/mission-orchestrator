@@ -40,6 +40,35 @@ def _validate_cue(cue: dict[str, Any], *, position: int) -> None:
     elif t == "on_timeout":
         if not isinstance(cue.get("seconds"), int) or cue["seconds"] <= 0:
             raise RPCError("bad_cue", "on_timeout requires positive 'seconds'")
+    elif t == "at_time":
+        # Fire at an absolute wall-clock time. Accept either:
+        #   epoch: unix seconds (timezone-independent), or
+        #   at:    local datetime string parsed in the machine's timezone
+        #          ("YYYY-MM-DD HH:MM[:SS]" or ISO "YYYY-MM-DDTHH:MM[:SS]").
+        # Normalize to cue["epoch"] so the engine never re-parses.
+        epoch = cue.get("epoch")
+        if epoch is None:
+            at = cue.get("at")
+            if not isinstance(at, str) or not at.strip():
+                raise RPCError("bad_cue", "at_time requires 'epoch' (int) or 'at' (datetime string)")
+            import time as _t
+            from datetime import datetime as _dt
+            s = at.strip().replace("T", " ")
+            parsed = None
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+                try:
+                    parsed = _dt.strptime(s, fmt)
+                    break
+                except ValueError:
+                    continue
+            if parsed is None:
+                raise RPCError("bad_cue", f"could not parse 'at' time: {at!r} (use 'YYYY-MM-DD HH:MM')")
+            # mktime interprets the struct as LOCAL time (machine tz).
+            epoch = int(_t.mktime(parsed.timetuple()))
+        if not isinstance(epoch, int) or epoch <= 0:
+            raise RPCError("bad_cue", "at_time 'epoch' must be a positive int")
+        cue["epoch"] = epoch  # normalized; stored with the step
+        cue.pop("at", None)
     else:
         raise RPCError("bad_cue", f"unknown cue type: {t}")
 

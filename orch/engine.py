@@ -211,6 +211,12 @@ class Engine:
             elif prev is None:
                 # No previous step to anchor the timer to; treat as immediate.
                 ready = True
+        elif cue["type"] == "at_time":
+            # Absolute wall-clock trigger. Fires once now >= the target epoch,
+            # regardless of the previous step. (Launch still only happens when
+            # the worker is idle, guarded by the caller.)
+            target = int(cue.get("epoch", 0))
+            ready = target > 0 and now >= target
         else:
             log.warning("unknown cue type for step %s: %s", nxt["id"], cue["type"])
             return
