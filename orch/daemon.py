@@ -34,14 +34,8 @@ def _validate_cue(cue: dict[str, Any], *, position: int) -> None:
             raise RPCError("bad_cue", "'immediate' is only valid for the first step")
     elif t == "on_current_complete":
         pass
-    elif t == "on_current_complete_or_timeout":
-        if not isinstance(cue.get("seconds"), int) or cue["seconds"] <= 0:
-            raise RPCError("bad_cue", "on_current_complete_or_timeout requires positive 'seconds'")
     elif t == "on_prev_complete":  # legacy alias (tail-chained); still accepted
         pass
-    elif t == "on_prev_complete_or_timeout":  # legacy alias
-        if not isinstance(cue.get("seconds"), int) or cue["seconds"] <= 0:
-            raise RPCError("bad_cue", "on_prev_complete_or_timeout requires positive 'seconds'")
     elif t == "on_timeout":
         if not isinstance(cue.get("seconds"), int) or cue["seconds"] <= 0:
             raise RPCError("bad_cue", "on_timeout requires positive 'seconds'")

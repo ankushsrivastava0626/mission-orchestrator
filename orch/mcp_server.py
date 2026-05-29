@@ -38,17 +38,15 @@ _CUE_SCHEMA: dict[str, Any] = {
     "description": (
         "Entry condition for a step. Types:\n"
         "  immediate                       - fire now (first step only)\n"
-        "  on_current_complete             - run NEXT, as soon as the currently running step "
-        "finishes. Jumps ahead of any other pending steps (use this to queue follow-up work that "
-        "should run immediately after the current step, even if a long queue is already waiting).\n"
-        "  on_current_complete_or_timeout  - same, with a `seconds` field (parity).\n"
-        "  on_timeout                      - `seconds` after the current step started, regardless "
-        "of completion\n"
-        "  at_time                         - at an absolute wall-clock time; give `at` "
+        "  on_current_complete  - run NEXT, as soon as the currently running step finishes. "
+        "Jumps ahead of any other pending steps (use this to queue follow-up work that should run "
+        "immediately after the current step, even if a long queue is already waiting).\n"
+        "  on_timeout           - `seconds` after the current step started, regardless of completion\n"
+        "  at_time              - at an absolute wall-clock time; give `at` "
         "(local datetime 'YYYY-MM-DD HH:MM', machine timezone) or `epoch` (unix seconds). "
         "Fires once that time passes and the worker is idle.\n"
-        "(Legacy: on_prev_complete / on_prev_complete_or_timeout still work - they chain to the "
-        "TAIL instead of jumping ahead. Prefer on_current_complete.)"
+        "(Legacy: on_prev_complete still works - it chains to the TAIL instead of jumping ahead. "
+        "Prefer on_current_complete.)"
     ),
     "properties": {
         "type": {
@@ -56,12 +54,11 @@ _CUE_SCHEMA: dict[str, Any] = {
             "enum": [
                 "immediate",
                 "on_current_complete",
-                "on_current_complete_or_timeout",
                 "on_timeout",
                 "at_time",
             ],
         },
-        "seconds": {"type": "integer", "minimum": 1, "description": "For the *_timeout cues."},
+        "seconds": {"type": "integer", "minimum": 1, "description": "For on_timeout."},
         "at": {"type": "string", "description": "For at_time: local datetime 'YYYY-MM-DD HH:MM'."},
         "epoch": {"type": "integer", "description": "For at_time: absolute unix seconds (alternative to `at`)."},
     },
@@ -112,7 +109,6 @@ Cue (entry condition for a step)
   {"type": "immediate"}                                    - fire as soon as queued (first step only)
   {"type": "on_current_complete"}                          - run NEXT, when the current step finishes;
                                                              jumps ahead of other pending steps
-  {"type": "on_current_complete_or_timeout", "seconds": N} - same, with a seconds field (parity)
   {"type": "on_timeout", "seconds": N}                     - fire N seconds after the current step started
   {"type": "at_time", "at": "YYYY-MM-DD HH:MM"}         - fire at an absolute wall-clock time (machine tz);
                                                           or {"type": "at_time", "epoch": <unix seconds>}.
@@ -186,9 +182,10 @@ Plus full Claude Code tooling (Bash, Read/Write, web) and any extra MCP servers
 configured for all workers (e.g. Playwright for browser automation), run with
 --dangerously-skip-permissions.
 
-So the worker can extend its own plan, add follow-ups, stop posting pings, browse
-the web, phone the user, and push messages/files up to you. It cannot create
-other missions, change Telegram destinations, or silence its own heartbeat.
+So the worker can extend its own plan, add follow-ups, stop posting pings, retime
+its own heartbeat (heartbeat.set, but not disable it), browse the web, phone the
+user, and push messages/files up to you. It cannot create other missions or
+change the Telegram destination.
 
 Three upward channels - keep them straight (the worker picks by audience+urgency):
   notify       → the human user, async text (Telegram). Routine updates/results.
@@ -482,9 +479,9 @@ HOST_TOOLS: list[Tool] = [
             "Example first step:\n"
             "  {mission_id, directive: \"Scrape r/python for the top 10 posts today and save to "
             "/tmp/posts.json\", cue: {type: \"immediate\"}}\n\n"
-            "Example follow-up with timeout:\n"
+            "Example follow-up that runs next:\n"
             "  {mission_id, directive: \"Summarize /tmp/posts.json and notify the user.\", "
-            "cue: {type: \"on_current_complete_or_timeout\", seconds: 300}}\n\n"
+            "cue: {type: \"on_current_complete\"}}\n\n"
             "Returns: {step_id: \"<uuid>\"}\n\n"
             "Tip: end your directive with explicit instructions about Telegram if you want a user-facing "
             "update - e.g. \"...then post a summary to the user via the notify tool.\""
@@ -800,7 +797,8 @@ WATCH FOR CONDITIONS WITHOUT BURNING TOKENS - pings.add(condition, action):
 
 OTHER TOOLS: queue.list/update/delete (manage your pending steps), pings.list/
   delete, mission.status, secrets.list/cookies.list (values via the `msec` CLI),
-  heartbeat.get. Plus full Claude Code tooling (Bash, Read/Write, web) and any
+  heartbeat.get/heartbeat.set (retime your own status-update cadence). Plus full
+  Claude Code tooling (Bash, Read/Write, web) and any
   shared MCPs (e.g. Playwright for browsers). You run with full permissions.
 
 LIFECYCLE: when your queue is empty, no pings exist, and you go idle, the mission
@@ -914,8 +912,21 @@ def _worker_tools() -> list[Tool]:
         ),
         Tool(
             name="heartbeat.get",
-            description="Read-only: get this mission's heartbeat configuration.",
+            description="Get this mission's heartbeat interval and last-fired time.",
             inputSchema=_obj({}, []),
+        ),
+        Tool(
+            name="heartbeat.set",
+            description=(
+                "Change your own heartbeat interval (seconds, max 86400 = 24h). The heartbeat "
+                "is the periodic nudge that asks you to send a status update via notify; it's "
+                "mandatory and can't be disabled, only retimed. Shorten it if the user wants more "
+                "frequent check-ins, lengthen it for quiet long-running work."
+            ),
+            inputSchema=_obj(
+                {"interval_s": {"type": "integer", "minimum": 1, "maximum": 86400}},
+                ["interval_s"],
+            ),
         ),
         Tool(
             name="mission.status",
@@ -973,6 +984,8 @@ def build_worker_server(mission_id: str) -> Server:
             return _text(_call("scripted_ping.delete", a))
         if name == "heartbeat.get":
             return _text(_call("heartbeat.get", {"mission_id": mission_id}))
+        if name == "heartbeat.set":
+            return _text(_call("heartbeat.set", {"mission_id": mission_id, "interval_s": args.get("interval_s")}))
         if name == "mission.status":
             return _text(_call("mission.get", {"mission_id": mission_id}))
         if name == "secrets.list":

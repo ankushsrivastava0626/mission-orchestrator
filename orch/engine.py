@@ -177,8 +177,7 @@ class Engine:
         # position) first, so multiple interjections keep their insertion order.
         nxt = self.conn.execute(
             "SELECT * FROM steps WHERE mission_id = ? AND state = 'pending'"
-            " ORDER BY CASE WHEN cue_type IN"
-            " ('on_current_complete', 'on_current_complete_or_timeout')"
+            " ORDER BY CASE WHEN cue_type = 'on_current_complete'"
             " THEN 0 ELSE 1 END, position ASC LIMIT 1",
             (mission_id,),
         ).fetchone()
@@ -192,7 +191,7 @@ class Engine:
         ready = False
         if cue["type"] == "immediate":
             ready = first_step or (prev is not None and prev["state"] in {"completed"})
-        elif cue["type"] in ("on_current_complete", "on_current_complete_or_timeout"):
+        elif cue["type"] == "on_current_complete":
             # We're only here when no step is running, i.e. the CURRENT step has
             # already finished - so a run-next step is ready immediately. (It also
             # sorted to the front above, so it preempts the rest of the queue.)
@@ -200,22 +199,6 @@ class Engine:
         elif cue["type"] == "on_prev_complete":
             # Legacy: gate on the immediately-preceding step (tail-chained plans).
             ready = prev is not None and prev["state"] in {"completed"}
-        elif cue["type"] == "on_prev_complete_or_timeout":
-            seconds = int(cue.get("seconds", 0))
-            if prev is None:
-                ready = True
-            elif prev["state"] == "completed":
-                ready = True
-            elif prev["started_at"] is not None and now - int(prev["started_at"]) >= seconds:
-                # Timeout the previous step.
-                db.set_step_state(self.conn, prev["id"], "timed_out", finished=True)
-                db.log_event(
-                    self.conn,
-                    mission_id=mission_id,
-                    kind="step_timed_out",
-                    step_id=prev["id"],
-                )
-                ready = True
         elif cue["type"] == "on_timeout":
             seconds = int(cue.get("seconds", 0))
             if prev is not None and prev["started_at"] is not None:
