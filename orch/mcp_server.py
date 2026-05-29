@@ -37,22 +37,26 @@ _CUE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "description": (
         "Entry condition for a step. Types:\n"
-        "  immediate                    - fire now (first step only)\n"
-        "  on_prev_complete             - when the previous step finishes\n"
-        "  on_prev_complete_or_timeout  - prev finishes OR `seconds` since prev started\n"
-        "  on_timeout                   - `seconds` after prev started, regardless of completion\n"
-        "  at_time                      - at an absolute wall-clock time; give `at` "
+        "  immediate                       - fire now (first step only)\n"
+        "  on_current_complete             - run NEXT, as soon as the currently running step "
+        "finishes. Jumps ahead of any other pending steps (use this to queue follow-up work that "
+        "should run immediately after the current step, even if a long queue is already waiting).\n"
+        "  on_current_complete_or_timeout  - same, with a `seconds` field (parity).\n"
+        "  on_timeout                      - `seconds` after the current step started, regardless "
+        "of completion\n"
+        "  at_time                         - at an absolute wall-clock time; give `at` "
         "(local datetime 'YYYY-MM-DD HH:MM', machine timezone) or `epoch` (unix seconds). "
-        "Fires once that time passes and the worker is idle; if the time is already "
-        "past when queued, fires as soon as the worker is idle."
+        "Fires once that time passes and the worker is idle.\n"
+        "(Legacy: on_prev_complete / on_prev_complete_or_timeout still work - they chain to the "
+        "TAIL instead of jumping ahead. Prefer on_current_complete.)"
     ),
     "properties": {
         "type": {
             "type": "string",
             "enum": [
                 "immediate",
-                "on_prev_complete",
-                "on_prev_complete_or_timeout",
+                "on_current_complete",
+                "on_current_complete_or_timeout",
                 "on_timeout",
                 "at_time",
             ],
@@ -105,10 +109,11 @@ Step
   Cue). Steps are LINEAR - they execute in `position` order, one at a time.
 
 Cue (entry condition for a step)
-  {"type": "immediate"}                                 - fire as soon as queued (first step only)
-  {"type": "on_prev_complete"}                          - wait until previous step finishes
-  {"type": "on_prev_complete_or_timeout", "seconds": N} - whichever happens first
-  {"type": "on_timeout", "seconds": N}                  - fire N seconds after previous step started, regardless
+  {"type": "immediate"}                                    - fire as soon as queued (first step only)
+  {"type": "on_current_complete"}                          - run NEXT, when the current step finishes;
+                                                             jumps ahead of other pending steps
+  {"type": "on_current_complete_or_timeout", "seconds": N} - same, with a seconds field (parity)
+  {"type": "on_timeout", "seconds": N}                     - fire N seconds after the current step started
   {"type": "at_time", "at": "YYYY-MM-DD HH:MM"}         - fire at an absolute wall-clock time (machine tz);
                                                           or {"type": "at_time", "epoch": <unix seconds>}.
                                                           Past times fire as soon as the worker is idle.
@@ -139,7 +144,7 @@ Secrets & Cookies
   1. mission_id = mission.create({name})
   2. (optional) secret.put / cookies.put for any credentials the worker needs
   3. step.add({mission_id, directive, cue: {type: "immediate"}})  ← first step
-  4. step.add(...) more steps with cue: {type: "on_prev_complete"}
+  4. step.add(...) more steps with cue: {type: "on_current_complete"}
   5. mission.get(mission_id) to monitor progress
   6. Auto-completion fires ONLY when ALL of these hold:
        - no pending or running steps
@@ -156,7 +161,7 @@ Secrets & Cookies
   7. REOPENING: call step.add on a 'completed' mission and it auto-transitions
      back to 'running'. The Claude session is restored via --resume (full
      prior context), tmux is recreated, the vault is still there. New step's
-     cue cannot be 'immediate' (use on_prev_complete instead - position > 0).
+     cue cannot be 'immediate' (use on_current_complete instead - position > 0).
   8. mission.delete(mission_id) to remove the row entirely (terminal states
      only). This is the ONLY operation that purges the vault.
 
@@ -461,11 +466,11 @@ HOST_TOOLS: list[Tool] = [
             "the tmux session is recreated, the worker MCP config is rewritten, state goes back to "
             "'running'. The Claude session resumes with full prior context (via --resume). The "
             "vault (secrets + cookies) is preserved across completion, so credentials are still "
-            "available. NOTE: on reopen, position is > 0, so cue must be on_prev_complete (or one "
+            "available. NOTE: on reopen, position is > 0, so cue must be on_current_complete (or one "
             "of the timeout variants), NOT immediate.\n\n"
             "Use this to queue work. The first step of a NEW mission must have cue {\"type\": "
             "\"immediate\"} (there's no previous step to wait on). Subsequent steps typically use "
-            "{\"type\": \"on_prev_complete\"}.\n\n"
+            "{\"type\": \"on_current_complete\"}.\n\n"
             "Args:\n"
             "  mission_id (required)\n"
             "  directive (required): the prompt text the worker Claude will receive. Write it as you "
@@ -479,7 +484,7 @@ HOST_TOOLS: list[Tool] = [
             "/tmp/posts.json\", cue: {type: \"immediate\"}}\n\n"
             "Example follow-up with timeout:\n"
             "  {mission_id, directive: \"Summarize /tmp/posts.json and notify the user.\", "
-            "cue: {type: \"on_prev_complete_or_timeout\", seconds: 300}}\n\n"
+            "cue: {type: \"on_current_complete_or_timeout\", seconds: 300}}\n\n"
             "Returns: {step_id: \"<uuid>\"}\n\n"
             "Tip: end your directive with explicit instructions about Telegram if you want a user-facing "
             "update - e.g. \"...then post a summary to the user via the notify tool.\""
@@ -781,7 +786,7 @@ PLAN YOUR OWN FUTURE - queue.add(directive, cue):
     {type:"at_time", at:"YYYY-MM-DD HH:MM"}  → fire at an absolute local time
     {type:"at_time", epoch:<unix seconds>}   → same, tz-independent
     {type:"on_timeout", seconds:N}           → N seconds after the prev step started
-    {type:"on_prev_complete"}                → after the current chain step finishes
+    {type:"on_current_complete"}              → run next, when the current step finishes
   Use this to plan ahead: e.g. "call the user at 9:00am", "retry in 30 minutes",
   "follow up tomorrow". The mission stays alive for scheduled steps - it won't
   auto-complete while steps are pending. So if you have future work, QUEUE IT
@@ -850,7 +855,7 @@ def _worker_tools() -> list[Tool]:
                 "Queue a future step for YOURSELF - a directive you'll receive later, gated by a "
                 "cue. This is how you plan ahead: schedule a follow-up at a specific time with "
                 "cue {type:'at_time', at:'YYYY-MM-DD HH:MM'} (machine local time) or {type:'at_time', "
-                "epoch:<unix>}; or chain work with on_prev_complete / on_timeout. The directive is "
+                "epoch:<unix>}; or chain work with on_current_complete / on_timeout. The directive is "
                 "the instruction future-you will act on (you keep full session context). "
                 "Example: schedule a 9am check-in, or re-attempt a call after 30 min."
             ),

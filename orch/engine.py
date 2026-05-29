@@ -171,9 +171,15 @@ class Engine:
             db.mark_ping_fired(self.conn, ping["id"], db.now_ts())
 
     def _maybe_launch_next_step(self, mission_id: str, now: int) -> None:
+        # "Run-next" cues (on_current_complete*) jump ahead of the rest of the
+        # queue: a worker can queue a step to run NEXT even when a long tail of
+        # steps is already pending. Among run-next steps, oldest (lowest
+        # position) first, so multiple interjections keep their insertion order.
         nxt = self.conn.execute(
             "SELECT * FROM steps WHERE mission_id = ? AND state = 'pending'"
-            " ORDER BY position ASC LIMIT 1",
+            " ORDER BY CASE WHEN cue_type IN"
+            " ('on_current_complete', 'on_current_complete_or_timeout')"
+            " THEN 0 ELSE 1 END, position ASC LIMIT 1",
             (mission_id,),
         ).fetchone()
         if nxt is None:
@@ -186,7 +192,13 @@ class Engine:
         ready = False
         if cue["type"] == "immediate":
             ready = first_step or (prev is not None and prev["state"] in {"completed"})
+        elif cue["type"] in ("on_current_complete", "on_current_complete_or_timeout"):
+            # We're only here when no step is running, i.e. the CURRENT step has
+            # already finished - so a run-next step is ready immediately. (It also
+            # sorted to the front above, so it preempts the rest of the queue.)
+            ready = True
         elif cue["type"] == "on_prev_complete":
+            # Legacy: gate on the immediately-preceding step (tail-chained plans).
             ready = prev is not None and prev["state"] in {"completed"}
         elif cue["type"] == "on_prev_complete_or_timeout":
             seconds = int(cue.get("seconds", 0))

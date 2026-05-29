@@ -32,9 +32,14 @@ def _validate_cue(cue: dict[str, Any], *, position: int) -> None:
     if t == "immediate":
         if position != 0:
             raise RPCError("bad_cue", "'immediate' is only valid for the first step")
-    elif t == "on_prev_complete":
+    elif t == "on_current_complete":
         pass
-    elif t == "on_prev_complete_or_timeout":
+    elif t == "on_current_complete_or_timeout":
+        if not isinstance(cue.get("seconds"), int) or cue["seconds"] <= 0:
+            raise RPCError("bad_cue", "on_current_complete_or_timeout requires positive 'seconds'")
+    elif t == "on_prev_complete":  # legacy alias (tail-chained); still accepted
+        pass
+    elif t == "on_prev_complete_or_timeout":  # legacy alias
         if not isinstance(cue.get("seconds"), int) or cue["seconds"] <= 0:
             raise RPCError("bad_cue", "on_prev_complete_or_timeout requires positive 'seconds'")
     elif t == "on_timeout":
@@ -500,6 +505,43 @@ def h_step_add(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     # mission resumes normal completion logic after this step runs.
     db.clear_mission_hold(d.conn, mission_id)
     return {"step_id": sid}
+
+
+def h_oob_inject(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Inject an out-of-band directive that fires the MOMENT the worker is idle,
+    jumping ahead of any queued/long-scheduled steps - without disturbing them
+    (pending steps keep their order and run afterward). Used to deliver a phoned-in
+    answer back to a worker that called talk_to_user and then went idle, so the
+    answer isn't tailed behind a step scheduled days out.
+
+    Args: {mission_id, directive, kind?}. Reopens a completed mission so its tmux
+    is live to receive it. Returns {ok, queued}."""
+    mission_id, directive = _require(p, "mission_id", "directive")
+    m = _mission_or_raise(d.conn, mission_id)
+    kind = p.get("kind") or "phone_relay"
+    if m["state"] == "completed":
+        try:
+            runner.tmux_create_session(mission_id)
+            runner.write_worker_mcp_config(mission_id)
+        except runner.RunnerError as e:
+            raise RPCError("reopen_failed", str(e))
+        d.conn.execute(
+            "UPDATE missions SET state = 'running', finished_at = NULL,"
+            " last_heartbeat_at = ? WHERE id = ?",
+            (db.now_ts(), mission_id),
+        )
+        db.log_event(d.conn, mission_id=mission_id, kind="mission_reopened")
+    elif m["state"] != "running":
+        raise RPCError(
+            "not_writable",
+            f"mission state is '{m['state']}'; only running/completed missions "
+            f"accept an injection.",
+        )
+    d.engine._enqueue_oob(mission_id, {"kind": kind, "directive": directive})
+    db.clear_mission_hold(d.conn, mission_id)  # answer arrived; resume normal flow
+    db.log_event(d.conn, mission_id=mission_id, kind="oob_injected",
+                 payload={"kind": kind})
+    return {"ok": True, "queued": True}
 
 
 def h_step_list(d: Daemon, p: dict[str, Any]) -> list[dict[str, Any]]:
@@ -997,6 +1039,7 @@ _HANDLERS: dict[str, Handler] = {
     "mission.pane_snapshot": h_mission_pane_snapshot,
     "mission.attach_info": h_mission_attach_info,
     "step.add": h_step_add,
+    "oob.inject": h_oob_inject,
     "step.list": h_step_list,
     "step.update": h_step_update,
     "step.delete": h_step_delete,
