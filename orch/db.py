@@ -56,6 +56,15 @@ CREATE TABLE IF NOT EXISTS events (
   ping_id TEXT,
   payload TEXT
 );
+CREATE TABLE IF NOT EXISTS locations (
+  chat_id TEXT PRIMARY KEY,
+  latitude REAL NOT NULL,
+  longitude REAL NOT NULL,
+  accuracy REAL,
+  heading REAL,
+  live INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS notify_map (
   telegram_message_id INTEGER PRIMARY KEY,
   mission_id TEXT NOT NULL,
@@ -121,6 +130,25 @@ def set_mission_hold(conn: sqlite3.Connection, mission_id: str, until_ts: int) -
 
 def clear_mission_hold(conn: sqlite3.Connection, mission_id: str) -> None:
     conn.execute("UPDATE missions SET hold_until = 0 WHERE id = ?", (mission_id,))
+
+
+def upsert_location(
+    conn: sqlite3.Connection, *, chat_id: str, latitude: float, longitude: float,
+    accuracy: float | None = None, heading: float | None = None, live: bool = False,
+) -> None:
+    conn.execute(
+        "INSERT INTO locations (chat_id, latitude, longitude, accuracy, heading, live, updated_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?)"
+        " ON CONFLICT(chat_id) DO UPDATE SET latitude=excluded.latitude,"
+        " longitude=excluded.longitude, accuracy=excluded.accuracy, heading=excluded.heading,"
+        " live=excluded.live, updated_at=excluded.updated_at",
+        (chat_id, float(latitude), float(longitude),
+         accuracy, heading, 1 if live else 0, now_ts()),
+    )
+
+
+def get_location(conn: sqlite3.Connection, chat_id: str) -> sqlite3.Row | None:
+    return conn.execute("SELECT * FROM locations WHERE chat_id = ?", (chat_id,)).fetchone()
 
 
 def map_notify_message(conn: sqlite3.Connection, message_id: int, mission_id: str) -> None:

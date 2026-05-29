@@ -290,6 +290,28 @@ def h_mission_get(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def h_location_get(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Latest known location of the mission's user (the telegram chat that owns
+    this mission). Returns {available: false} if the user never shared one."""
+    (mission_id,) = _require(p, "mission_id")
+    m = _mission_or_raise(d.conn, mission_id)
+    row = db.get_location(d.conn, str(m["telegram_chat_id"]))
+    if row is None:
+        return {"available": False}
+    age = db.now_ts() - int(row["updated_at"])
+    return {
+        "available": True,
+        "latitude": row["latitude"],
+        "longitude": row["longitude"],
+        "accuracy_m": row["accuracy"],
+        "heading": row["heading"],
+        "live": bool(row["live"]),
+        "updated_at": row["updated_at"],
+        "age_seconds": age,
+        "maps_url": f"https://maps.google.com/?q={row['latitude']},{row['longitude']}",
+    }
+
+
 def h_mission_events(d: Daemon, p: dict[str, Any]) -> list[dict[str, Any]]:
     """Return the structured audit log for a mission."""
     (mission_id,) = _require(p, "mission_id")
@@ -1030,6 +1052,7 @@ _HANDLERS: dict[str, Handler] = {
     "mission.cancel": h_mission_cancel,
     "mission.delete": h_mission_delete,
     "mission.events": h_mission_events,
+    "location.get": h_location_get,
     "mission.pane_snapshot": h_mission_pane_snapshot,
     "mission.attach_info": h_mission_attach_info,
     "step.add": h_step_add,

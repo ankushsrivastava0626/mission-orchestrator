@@ -795,6 +795,10 @@ WATCH FOR CONDITIONS WITHOUT BURNING TOKENS - pings.add(condition, action):
   you when the condition fires (or if it breaks). Good for "tell me when X
   happens" / "watch until the deadline."
 
+LOCATION: get_user_location returns the user's latest shared location (and the
+  live position as they move, if they shared live location). Combine with a ping
+  to watch geofences ("notify when I'm within 500m of home").
+
 OTHER TOOLS: queue.list/update/delete (manage your pending steps), pings.list/
   delete, mission.status, secrets.list/cookies.list (values via the `msec` CLI),
   heartbeat.get/heartbeat.set (retime your own status-update cadence). Plus full
@@ -934,6 +938,19 @@ def _worker_tools() -> list[Tool]:
             inputSchema=_obj({}, []),
         ),
         Tool(
+            name="get_user_location",
+            description=(
+                "Get the user's latest shared location (latitude/longitude). If the user shared a "
+                "LIVE location, this returns the most recent fix as they move - call it again any "
+                "time for an updated position. Use for location-aware tasks (e.g. 'tell me when I'm "
+                "near home', distance/ETA, where-are-they checks).\n\n"
+                "Returns: {available, latitude, longitude, accuracy_m, heading, live, updated_at, "
+                "age_seconds, maps_url} - or {available:false} if the user never shared one. Check "
+                "age_seconds: a large value means the location is stale / live sharing ended."
+            ),
+            inputSchema=_obj({}, []),
+        ),
+        Tool(
             name="secrets.list",
             description="List secret names (values via the msec CLI).",
             inputSchema=_obj({}, []),
@@ -988,6 +1005,8 @@ def build_worker_server(mission_id: str) -> Server:
             return _text(_call("heartbeat.set", {"mission_id": mission_id, "interval_s": args.get("interval_s")}))
         if name == "mission.status":
             return _text(_call("mission.get", {"mission_id": mission_id}))
+        if name == "get_user_location":
+            return _text(_call("location.get", {"mission_id": mission_id}))
         if name == "secrets.list":
             return _text(_call("secret.list", {"mission_id": mission_id}))
         if name == "cookies.list":

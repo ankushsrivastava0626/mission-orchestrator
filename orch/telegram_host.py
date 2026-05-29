@@ -164,7 +164,7 @@ class TelegramHost:
         params = {
             "offset": self._offset,
             "timeout": 25,
-            "allowed_updates": json.dumps(["message", "callback_query"]),
+            "allowed_updates": json.dumps(["message", "edited_message", "callback_query"]),
         }
         try:
             r = await client.get(url, params=params)
@@ -181,6 +181,19 @@ class TelegramHost:
             return
         for update in data.get("result", []):
             self._offset = max(self._offset, update["update_id"] + 1)
+            # Location shares (initial or live-edit) arrive as message/edited_message
+            # with a `location` field - handle those first.
+            loc_msg = None
+            edited = "edited_message" in update
+            if "message" in update and "location" in update["message"]:
+                loc_msg = update["message"]
+            elif edited and "location" in update.get("edited_message", {}):
+                loc_msg = update["edited_message"]
+            if loc_msg is not None:
+                chat_id = str(loc_msg["chat"]["id"])
+                if chat_id in self.allowed:
+                    await self._handle_location(client, chat_id, loc_msg, is_edit=edited)
+                continue
             if "message" in update and "text" in update["message"]:
                 msg = update["message"]
                 chat_id = str(msg["chat"]["id"])
@@ -402,6 +415,53 @@ class TelegramHost:
             await self._prompt_reply(client, chat_id, arg)
         else:
             await self._send(client, chat_id, f"❌ unknown action `{action}`")
+
+    async def _handle_location(
+        self, client: httpx.AsyncClient, chat_id: str, msg: dict, is_edit: bool,
+    ) -> None:
+        loc = msg.get("location", {})
+        lat, lon = loc.get("latitude"), loc.get("longitude")
+        if lat is None or lon is None:
+            return
+        live = "live_period" in loc
+        db.upsert_location(
+            self.daemon.conn, chat_id=chat_id, latitude=lat, longitude=lon,
+            accuracy=loc.get("horizontal_accuracy"), heading=loc.get("heading"),
+            live=live,
+        )
+        # Only react on the INITIAL share (not every live-movement edit, which
+        # would spam). Edits silently update the stored fix.
+        if is_edit:
+            return
+        kind = "live location" if live else "location"
+        # If a mission is pinned to this chat, let its worker know a fresh share
+        # started, so it can act (and call get_user_location for the live value).
+        pinned = self._pinned.get(chat_id)
+        if pinned:
+            m = self.daemon.conn.execute(
+                "SELECT state, name FROM missions WHERE id = ?", (pinned,)
+            ).fetchone()
+            if m and m["state"] in ("running", "cancelling"):
+                directive = (
+                    f"[The user just shared their {kind}: {lat}, {lon}"
+                    f"{' (live, updating)' if live else ''}. "
+                    f"https://maps.google.com/?q={lat},{lon}] "
+                    f"Use the get_user_location tool any time to read the latest fix. "
+                    f"Act on this if relevant, and reply via notify."
+                )
+                self.daemon.engine._enqueue_oob(
+                    pinned, {"kind": "user_location", "directive": directive}
+                )
+                await self._send(
+                    client, chat_id,
+                    f"📍 {kind} shared - forwarded to *{m['name']}*.",
+                )
+                return
+        await self._send(
+            client, chat_id,
+            f"📍 {kind} saved. Workers can read it via get_user_location. "
+            f"(Pin a mission first if you want a worker to act on it now.)",
+        )
 
     async def _route_reply(
         self, client: httpx.AsyncClient, chat_id: str, mission_id: str,
