@@ -66,6 +66,7 @@ def _mission_actions_kb(state: str, sid: str) -> dict:
     # Reply is available for running and completed missions (completed reopens).
     if state in ("running", "cancelling", "completed"):
         rows.append([_btn("💬 reply / talk to worker", f"reply:{sid}")])
+    rows.append([_btn("📞 calling name", f"callname:{sid}")])
     if state == "running":
         rows.append([
             _btn("✋ soft cancel", f"cancel:{sid}"),
@@ -118,6 +119,9 @@ class TelegramHost:
         # Sticky conversation: chat_id -> mission_id. A reply pins; plain text
         # then routes to the pinned mission until /unpin or a reply elsewhere.
         self._pinned: dict[str, str] = {}
+        # One-shot input prompts: prompt_message_id -> (action, mission_id).
+        # The user's reply to that prompt is consumed by the action, not routed.
+        self._pending_input: dict[int, tuple] = {}
         # Live "typing…" keeper tasks, kept referenced so they aren't GC'd.
         self._typing_tasks: set = set()
 
@@ -205,9 +209,16 @@ class TelegramHost:
                     continue
                 text = msg["text"]
                 msg_id = msg.get("message_id")
+                reply_to = msg.get("reply_to_message")
+                # 0. Reply to a one-shot input prompt (e.g. set calling name) →
+                #    consume it as that action, don't route to a worker.
+                if reply_to is not None:
+                    pend = self._pending_input.pop(reply_to.get("message_id", -1), None)
+                    if pend is not None:
+                        await self._consume_input(client, chat_id, pend, text, msg_id)
+                        continue
                 # 1. Reply to a mapped worker/prompt message → route + pin the
                 #    conversation to that mission.
-                reply_to = msg.get("reply_to_message")
                 if reply_to is not None:
                     replied_mid = db.mission_for_notify(
                         self.daemon.conn, reply_to.get("message_id", -1)
@@ -297,6 +308,52 @@ class TelegramHost:
         except Exception:
             log.exception("telegram_host send failed")
         return None
+
+    async def _consume_input(
+        self, client: httpx.AsyncClient, chat_id: str, pend: tuple,
+        text: str, msg_id: int | None,
+    ) -> None:
+        action, mid = pend
+        if action == "call_name":
+            val = text.strip()
+            clear = val in ("-", "")
+            try:
+                r = self._rpc("mission.set_call_name", {
+                    "mission_id": mid, "call_name": None if clear else val,
+                })
+            except Exception as e:  # noqa: BLE001
+                await self._send(client, chat_id, f"❌ {e}", msg_id)
+                return
+            row = self.daemon.conn.execute("SELECT name FROM missions WHERE id=?", (mid,)).fetchone()
+            mname = row["name"] if row else mid
+            if r.get("call_name"):
+                await self._send(client, chat_id, f"📞 calling name for *{mname}* set to *{r['call_name']}*.", msg_id)
+            else:
+                await self._send(client, chat_id, f"📞 calling name for *{mname}* cleared (will use the mission name).", msg_id)
+            return
+        await self._send(client, chat_id, f"❌ unknown input action {action}", msg_id)
+
+    async def _prompt_call_name(
+        self, client: httpx.AsyncClient, chat_id: str, sid: str,
+    ) -> None:
+        try:
+            mid = self._resolve_mid(sid)
+        except CommandError as e:
+            await self._send(client, chat_id, f"❌ {e}")
+            return
+        row = self.daemon.conn.execute(
+            "SELECT name, call_name FROM missions WHERE id = ?", (mid,)
+        ).fetchone()
+        cur = (row["call_name"] if row else None) or f"(none - uses mission name '{row['name'] if row else sid}')"
+        prompt_id = await self._send(
+            client, chat_id,
+            f"📞 Current calling name: *{cur}*\n\nReply with the new calling name "
+            f"(what shows on your phone when this mission's worker calls you). "
+            f"Send `-` to clear it.",
+            force_reply=True,
+        )
+        if prompt_id is not None:
+            self._pending_input[prompt_id] = ("call_name", mid)
 
     async def _prompt_reply(
         self, client: httpx.AsyncClient, chat_id: str, sid: str,
@@ -413,6 +470,8 @@ class TelegramHost:
             await self._dispatch_and_send(client, chat_id, "delete", [arg])
         elif action == "reply":
             await self._prompt_reply(client, chat_id, arg)
+        elif action == "callname":
+            await self._prompt_call_name(client, chat_id, arg)
         else:
             await self._send(client, chat_id, f"❌ unknown action `{action}`")
 

@@ -290,6 +290,24 @@ def h_mission_get(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def h_mission_set_call_name(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Set the display name used when a worker phones the user (J-dawg voice).
+    Empty/None clears it (falls back to the mission name)."""
+    (mission_id,) = _require(p, "mission_id")
+    _mission_or_raise(d.conn, mission_id)
+    name = p.get("call_name")
+    if name is not None:
+        name = str(name).strip()[:64]
+        if name in ("", "-"):
+            name = None
+    db.set_mission_call_name(d.conn, mission_id, name)
+    db.log_event(
+        d.conn, mission_id=mission_id, kind="call_name_set",
+        payload={"call_name": name},
+    )
+    return {"ok": True, "call_name": name}
+
+
 def h_location_get(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     """Latest known location of the mission's user (the telegram chat that owns
     this mission). Returns {available: false} if the user never shared one."""
@@ -1053,6 +1071,7 @@ _HANDLERS: dict[str, Handler] = {
     "mission.delete": h_mission_delete,
     "mission.events": h_mission_events,
     "location.get": h_location_get,
+    "mission.set_call_name": h_mission_set_call_name,
     "mission.pane_snapshot": h_mission_pane_snapshot,
     "mission.attach_info": h_mission_attach_info,
     "step.add": h_step_add,

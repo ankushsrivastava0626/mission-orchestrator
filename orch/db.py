@@ -23,7 +23,8 @@ CREATE TABLE IF NOT EXISTS missions (
   finished_at INTEGER,
   restart_count INTEGER NOT NULL DEFAULT 0,
   last_heartbeat_at INTEGER,
-  hold_until INTEGER NOT NULL DEFAULT 0
+  hold_until INTEGER NOT NULL DEFAULT 0,
+  call_name TEXT
 );
 CREATE TABLE IF NOT EXISTS steps (
   id TEXT PRIMARY KEY,
@@ -120,6 +121,12 @@ def init_schema(conn: sqlite3.Connection) -> None:
     cols = {r["name"] for r in conn.execute("PRAGMA table_info(missions)")}
     if "hold_until" not in cols:
         conn.execute("ALTER TABLE missions ADD COLUMN hold_until INTEGER NOT NULL DEFAULT 0")
+    if "call_name" not in cols:
+        conn.execute("ALTER TABLE missions ADD COLUMN call_name TEXT")
+
+
+def set_mission_call_name(conn: sqlite3.Connection, mission_id: str, name: str | None) -> None:
+    conn.execute("UPDATE missions SET call_name = ? WHERE id = ?", (name, mission_id))
 
 
 def set_mission_hold(conn: sqlite3.Connection, mission_id: str, until_ts: int) -> None:
