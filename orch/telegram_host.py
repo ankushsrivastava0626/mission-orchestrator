@@ -66,7 +66,8 @@ def _mission_actions_kb(state: str, sid: str) -> dict:
     # Reply is available for running and completed missions (completed reopens).
     if state in ("running", "cancelling", "completed"):
         rows.append([_btn("💬 reply / talk to worker", f"reply:{sid}")])
-    rows.append([_btn("📞 calling name", f"callname:{sid}")])
+    rows.append([_btn("📞 calling name", f"callname:{sid}"),
+                 _btn("🗜 compact", f"compact:{sid}")])
     if state == "running":
         rows.append([
             _btn("✋ soft cancel", f"cancel:{sid}"),
@@ -333,6 +334,35 @@ class TelegramHost:
             return
         await self._send(client, chat_id, f"❌ unknown input action {action}", msg_id)
 
+    async def _do_compact(
+        self, client: httpx.AsyncClient, chat_id: str, sid: str,
+    ) -> None:
+        try:
+            mid = self._resolve_mid(sid)
+        except CommandError as e:
+            await self._send(client, chat_id, f"❌ {e}")
+            return
+        info = self._rpc("mission.context_info", {"mission_id": mid})
+        row = self.daemon.conn.execute("SELECT name FROM missions WHERE id=?", (mid,)).fetchone()
+        mname = row["name"] if row else sid
+        if not info.get("available"):
+            tok_line = "context size: unknown (no transcript yet)"
+        else:
+            tok_line = (f"context now: *{info['context_tokens']:,} tokens* "
+                        f"({info['turns']} turns, {info['transcript_mb']} MB) - "
+                        f"re-read on every wake")
+        try:
+            r = self._rpc("mission.compact", {"mission_id": mid})
+        except Exception as e:  # noqa: BLE001
+            await self._send(client, chat_id, f"🗜 *{mname}*\n{tok_line}\n\n❌ {e}")
+            return
+        await self._send(
+            client, chat_id,
+            f"🗜 *{mname}*\n{tok_line}\n\nCompaction started - it'll shrink to a small "
+            f"summary shortly; future wakes get much cheaper. Tap 🔄 refresh / 🗜 again "
+            f"in a minute to see the new size.",
+        )
+
     async def _prompt_call_name(
         self, client: httpx.AsyncClient, chat_id: str, sid: str,
     ) -> None:
@@ -472,6 +502,8 @@ class TelegramHost:
             await self._prompt_reply(client, chat_id, arg)
         elif action == "callname":
             await self._prompt_call_name(client, chat_id, arg)
+        elif action == "compact":
+            await self._do_compact(client, chat_id, arg)
         else:
             await self._send(client, chat_id, f"❌ unknown action `{action}`")
 
@@ -725,14 +757,22 @@ def _cmd_get(self: TelegramHost, args: list[str]) -> Reply:
     mid = self._resolve_mid(args[0])
     snap = self._rpc("mission.get", {"mission_id": mid})
     m = snap["mission"]
+    cname = m.get("call_name")
     lines = [
         f"*{m['name']}*  `{_short(mid)}`",
         f"state: {m['state']}  restarts: {m['restart_count']}",
         f"heartbeat: every {m['heartbeat_interval_s']}s",
-        f"chat: {m['telegram_chat_id']}",
-        "",
-        f"*steps* ({len(snap['steps'])}):",
+        f"chat: {m['telegram_chat_id']}" + (f"  caller: {cname}" if cname else ""),
     ]
+    try:
+        ci = self._rpc("mission.context_info", {"mission_id": mid})
+        if ci.get("available"):
+            warn = " ⚠️" if ci["context_tokens"] >= 200000 else ""
+            lines.append(f"🧠 context: ~{ci['context_tokens']:,} tokens "
+                         f"({ci['turns']} turns){warn}  - re-read each wake")
+    except Exception:
+        pass
+    lines += ["", f"*steps* ({len(snap['steps'])}):"]
     for s in snap["steps"]:
         body = (s["directive"] or "").splitlines()[0][:70]
         lines.append(f"  [{s['position']}] {s['state']:10} {body}")

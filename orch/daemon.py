@@ -308,6 +308,86 @@ def h_mission_set_call_name(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "call_name": name}
 
 
+def _session_jsonl(mission_id: str) -> str | None:
+    import glob
+    base = os.path.expanduser("~/.claude/projects")
+    hits = glob.glob(f"{base}/*/{mission_id}.jsonl")
+    return hits[0] if hits else None
+
+
+def _context_tokens(path: str) -> tuple[int, int]:
+    """(last-turn context tokens, turn count) from a session jsonl."""
+    import json as _json
+    last = 0
+    turns = 0
+    with open(path) as fh:
+        for line in fh:
+            turns += 1
+            try:
+                o = _json.loads(line)
+            except Exception:
+                continue
+            u = (o.get("message") or {}).get("usage") or {}
+            tot = ((u.get("input_tokens") or 0)
+                   + (u.get("cache_read_input_tokens") or 0)
+                   + (u.get("cache_creation_input_tokens") or 0))
+            if tot > 0:
+                last = tot
+    return last, turns
+
+
+def h_mission_context_info(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Live context size of a mission's worker session - what each wake re-ingests."""
+    (mission_id,) = _require(p, "mission_id")
+    _mission_or_raise(d.conn, mission_id)
+    path = _session_jsonl(mission_id)
+    if not path:
+        return {"available": False}
+    tokens, turns = _context_tokens(path)
+    size = os.path.getsize(path)
+    return {
+        "available": True,
+        "context_tokens": tokens,
+        "turns": turns,
+        "transcript_bytes": size,
+        "transcript_mb": round(size / 1048576, 2),
+    }
+
+
+def h_mission_compact(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Compact a mission's worker session (headless `claude --resume -p /compact`),
+    so future wakes re-ingest a small summary instead of the whole transcript.
+    Runs detached; returns immediately with the pre-compaction size."""
+    import subprocess
+    (mission_id,) = _require(p, "mission_id")
+    _mission_or_raise(d.conn, mission_id)
+    if runner.step_running(mission_id):
+        raise RPCError("busy", "the worker is mid-turn; try again when idle")
+    path = _session_jsonl(mission_id)
+    before = _context_tokens(path)[0] if path else 0
+    # Resolve claude's absolute path (daemon runs under systemd's minimal PATH).
+    import shutil
+    claude_bin = (shutil.which("claude")
+                  or os.path.expanduser("~/.local/bin/claude")
+                  or "claude")
+    # Claude keys sessions by project = cwd. Orch worker sessions live under
+    # ~/.claude/projects/-/ (cwd "/"), so --resume only finds them from "/".
+    # Run the compact from there, with stdin closed (/compact takes no input).
+    subprocess.Popen(
+        [claude_bin, "--resume", mission_id, "--dangerously-skip-permissions",
+         "-p", "/compact"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        start_new_session=True, cwd="/",
+        env={**os.environ, "PATH": os.environ.get("PATH", "") + ":/root/.local/bin"},
+    )
+    db.log_event(
+        d.conn, mission_id=mission_id, kind="compact_started",
+        payload={"before_tokens": before},
+    )
+    return {"ok": True, "started": True, "before_tokens": before}
+
+
 def h_location_get(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     """Latest known location of the mission's user (the telegram chat that owns
     this mission). Returns {available: false} if the user never shared one."""
@@ -1072,6 +1152,8 @@ _HANDLERS: dict[str, Handler] = {
     "mission.events": h_mission_events,
     "location.get": h_location_get,
     "mission.set_call_name": h_mission_set_call_name,
+    "mission.context_info": h_mission_context_info,
+    "mission.compact": h_mission_compact,
     "mission.pane_snapshot": h_mission_pane_snapshot,
     "mission.attach_info": h_mission_attach_info,
     "step.add": h_step_add,

@@ -226,11 +226,18 @@ def step_running(mission_id: str) -> bool:
     attaching to the tmux pane and running other commands (which would fool
     a foreground-command check).
     """
+    # Match only a real claude invocation for this session: `--resume <id>` or
+    # `--session-id <id>`. The old `claude .*<id>` pattern false-matched any
+    # process whose cmdline merely contained '.claude/...' AND the id (e.g. a
+    # shell using the .claude snapshot path while referencing the mission id).
     try:
         res = subprocess.run(
-            ["pgrep", "-af", f"claude .*{mission_id}"],
+            ["pgrep", "-af", f"(resume|session-id) {mission_id}"],
             capture_output=True,
         )
     except FileNotFoundError:
         return False
-    return res.returncode == 0 and bool(res.stdout.strip())
+    for line in res.stdout.decode("utf-8", "replace").splitlines():
+        if "claude" in line and ("--resume " in line or "--session-id " in line):
+            return True
+    return False
