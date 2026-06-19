@@ -26,7 +26,7 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
-from . import config, db, runner
+from . import config, db, runner, telegram
 
 log = logging.getLogger(__name__)
 
@@ -55,6 +55,7 @@ def _ikb(rows: list[list[dict]]) -> dict:
 def _main_menu_kb() -> dict:
     return _ikb([
         [_btn("📋 list missions", "missions")],
+        [_btn("🧠 context sizes", "context")],
         [_btn("❓ all commands (text help)", "helptext")],
     ])
 
@@ -94,7 +95,8 @@ def _missions_list_kb(rows_db: list[Any]) -> dict:
         if len(label) > 50:
             label = label[:47] + "…"
         rows.append([_btn(label, f"m:{_short(r['id'])}")])
-    rows.append([_btn("🔄 refresh", "missions"), _btn("❓ help", "help")])
+    rows.append([_btn("🧠 context sizes", "context"),
+                 _btn("🔄 refresh", "missions")])
     return _ikb(rows)
 
 
@@ -114,6 +116,11 @@ class TelegramHost:
         self.allowed: set[str] = {
             cid.strip() for cid in allowed_raw.split(",") if cid.strip()
         }
+        # Forum supergroup hosting one topic per mission (optional). Auto-allow
+        # it so messages from its topics aren't dropped.
+        self.topics_chat_id: str | None = config.topics_chat_id()
+        if self.topics_chat_id:
+            self.allowed.add(self.topics_chat_id)
         self._stop = asyncio.Event()
         self._offset = 0
         self._bot_username: str | None = None
@@ -125,6 +132,12 @@ class TelegramHost:
         self._pending_input: dict[int, tuple] = {}
         # Live "typing…" keeper tasks, kept referenced so they aren't GC'd.
         self._typing_tasks: set = set()
+        # Reply coalescing: buffer rapid user messages to one mission and flush
+        # them as a SINGLE directive after a short quiet window, so firing off
+        # several quick messages wakes the worker once with all of them.
+        self._reply_buf: dict[str, list[str]] = {}
+        self._reply_ctx: dict[str, tuple] = {}   # mission_id -> (chat_id, thread_id)
+        self._reply_timers: dict[str, asyncio.Task] = {}
 
     def configured(self) -> bool:
         return bool(self.token and self.allowed)
@@ -199,6 +212,23 @@ class TelegramHost:
                 if chat_id in self.allowed:
                     await self._handle_location(client, chat_id, loc_msg, is_edit=edited)
                 continue
+            # New forum topic created in the topics group → spin up a mission
+            # bound to it (the "create a topic = create a mission" flow).
+            tmsg = update.get("message") or {}
+            if (self.topics_chat_id and "forum_topic_created" in tmsg
+                    and str(tmsg.get("chat", {}).get("id")) == self.topics_chat_id):
+                await self._handle_topic_created(client, tmsg)
+                continue
+            # Attachment (photo / document / audio / video / voice / …) → download
+            # it and hand the worker the local path. Captions come along too.
+            _media_keys = ("photo", "document", "audio", "video", "voice",
+                           "animation", "video_note")
+            if "message" in update and any(k in update["message"] for k in _media_keys):
+                mmsg = update["message"]
+                chat_id = str(mmsg["chat"]["id"])
+                if chat_id in self.allowed:
+                    await self._handle_media(client, chat_id, mmsg)
+                continue
             if "message" in update and "text" in update["message"]:
                 msg = update["message"]
                 chat_id = str(msg["chat"]["id"])
@@ -218,6 +248,19 @@ class TelegramHost:
                     if pend is not None:
                         await self._consume_input(client, chat_id, pend, text, msg_id)
                         continue
+                # 0b. Message inside a mission's forum topic → route straight to
+                #     that mission's worker. The topic IS the binding, so no pin
+                #     and no banner; replies post back into the same topic.
+                thread_id = msg.get("message_thread_id")
+                if (self.topics_chat_id and chat_id == self.topics_chat_id
+                        and thread_id):
+                    tmid = db.mission_for_topic(self.daemon.conn, thread_id)
+                    if tmid is not None:
+                        await self._route_reply(
+                            client, chat_id, tmid, text, msg_id, thread_id=thread_id
+                        )
+                    # Unknown topic (e.g. a manual one) → ignore silently.
+                    continue
                 # 1. Reply to a mapped worker/prompt message → route + pin the
                 #    conversation to that mission.
                 if reply_to is not None:
@@ -276,7 +319,7 @@ class TelegramHost:
     async def _send(
         self, client: httpx.AsyncClient, chat_id: str, text: str,
         reply_to: int | None = None, markup: dict | None = None,
-        force_reply: bool = False,
+        force_reply: bool = False, thread_id: int | None = None,
     ) -> int | None:
         """Send a message. Returns the sent message_id (or None on failure)."""
         if len(text) > 3900:
@@ -286,6 +329,8 @@ class TelegramHost:
             "text": text,
             "parse_mode": "Markdown",
         }
+        if thread_id is not None:
+            body["message_thread_id"] = thread_id
         if reply_to is not None:
             body["reply_to_message_id"] = reply_to
         if markup is not None:
@@ -415,31 +460,42 @@ class TelegramHost:
         except Exception:
             pass
 
-    async def _send_typing(self, client: httpx.AsyncClient, chat_id: str) -> None:
+    async def _send_typing(
+        self, client: httpx.AsyncClient, chat_id: str, thread_id: int | None = None
+    ) -> None:
         try:
+            body: dict[str, Any] = {"chat_id": chat_id, "action": "typing"}
+            if thread_id is not None:
+                body["message_thread_id"] = thread_id
             await client.post(
                 f"https://api.telegram.org/bot{self.token}/sendChatAction",
-                json={"chat_id": chat_id, "action": "typing"}, timeout=5,
+                json=body, timeout=5,
             )
         except Exception:
             pass
 
-    def _start_typing(self, client: httpx.AsyncClient, chat_id: str, mission_id: str) -> None:
+    def _start_typing(
+        self, client: httpx.AsyncClient, chat_id: str, mission_id: str,
+        thread_id: int | None = None,
+    ) -> None:
         """Show 'typing…' in the chat until the worker emits its next notify."""
         since = db.now_ts()
-        task = asyncio.create_task(self._typing_loop(client, chat_id, mission_id, since))
+        task = asyncio.create_task(
+            self._typing_loop(client, chat_id, mission_id, since, thread_id)
+        )
         self._typing_tasks.add(task)
         task.add_done_callback(self._typing_tasks.discard)
 
     async def _typing_loop(
         self, client: httpx.AsyncClient, chat_id: str, mission_id: str, since: int,
+        thread_id: int | None = None,
     ) -> None:
         # Telegram's typing action lasts ~5s; refresh it every 4s until the
         # worker sends a notify (its reply) or we hit a safety timeout.
         import time as _t
         deadline = _t.time() + 240
         while _t.time() < deadline:
-            await self._send_typing(client, chat_id)
+            await self._send_typing(client, chat_id, thread_id)
             await asyncio.sleep(4)
             row = self.daemon.conn.execute(
                 "SELECT 1 FROM events WHERE mission_id = ? AND kind = 'notify_sent'"
@@ -482,6 +538,8 @@ class TelegramHost:
         # Map callback action codes to command names + args.
         if action == "missions":
             await self._dispatch_and_send(client, chat_id, "missions", [])
+        elif action == "context":
+            await self._dispatch_and_send(client, chat_id, "context", [])
         elif action == "help":
             await self._dispatch_and_send(client, chat_id, "help", [])
         elif action == "helptext":
@@ -554,52 +612,193 @@ class TelegramHost:
             f"(Pin a mission first if you want a worker to act on it now.)",
         )
 
+    async def _handle_topic_created(
+        self, client: httpx.AsyncClient, msg: dict[str, Any]
+    ) -> None:
+        """A user created a forum topic in the topics group → create a mission
+        bound to it. Topics orch creates itself (for new missions) are skipped."""
+        thread_id = msg.get("message_thread_id")
+        if thread_id is None:
+            return
+        # Skip topics the bot itself created (orch auto-creates one per mission).
+        frm = msg.get("from") or {}
+        bot_id = self.token.split(":")[0]
+        if str(frm.get("id")) == bot_id:
+            return
+        # Already bound to a mission? (race / duplicate update) → nothing to do.
+        if db.mission_for_topic(self.daemon.conn, thread_id) is not None:
+            return
+        name = (msg.get("forum_topic_created") or {}).get("name") or f"topic-{thread_id}"
+        try:
+            res = self._rpc("mission.create", {"name": name, "tg_topic_id": thread_id})
+            mid = res.get("mission_id")
+        except Exception as e:  # noqa: BLE001
+            await self._send(
+                client, self.topics_chat_id,
+                f"❌ couldn't create a mission for this topic: {e}",
+                thread_id=thread_id,
+            )
+            return
+        db.log_event(self.daemon.conn, mission_id=mid, kind="mission_from_topic")
+        await self._send(
+            client, self.topics_chat_id,
+            f"🤖 Mission *{name}* created and bound to this topic. Just type what "
+            f"you'd like me to do - I'll get started and report back right here.",
+            thread_id=thread_id,
+        )
+
+    async def _handle_media(
+        self, client: httpx.AsyncClient, chat_id: str, msg: dict[str, Any]
+    ) -> None:
+        """User sent an attachment → download it and route the local path to the
+        target worker (the mission's topic, or the pinned DM conversation)."""
+        msg_id = msg.get("message_id")
+        thread_id = msg.get("message_thread_id")
+        caption = msg.get("caption") or ""
+        # Pick the file_id + a human label for the kind of attachment.
+        file_id = None
+        kind = "file"
+        if msg.get("photo"):
+            file_id = msg["photo"][-1]["file_id"]  # largest rendition
+            kind = "photo"
+        else:
+            for k in ("document", "video", "audio", "voice", "animation", "video_note"):
+                if k in msg and isinstance(msg[k], dict):
+                    file_id = msg[k].get("file_id")
+                    kind = k
+                    break
+        if not file_id:
+            return
+        # Resolve which mission this file is for.
+        if (self.topics_chat_id and chat_id == self.topics_chat_id and thread_id):
+            mission_id = db.mission_for_topic(self.daemon.conn, thread_id)
+            if mission_id is None:
+                return  # unknown topic → ignore
+        else:
+            mission_id = self._pinned.get(chat_id)
+            thread_id = None
+        if mission_id is None:
+            await self._send(
+                client, chat_id,
+                "📎 Got a file, but no mission is active here. Open a mission's topic "
+                "(or reply to one) first, then resend.",
+                msg_id,
+            )
+            return
+        info = telegram.download_file_via(self.token, file_id, f"/root/.orch/incoming/{mission_id}")
+        if info is None:
+            await self._send(
+                client, chat_id,
+                "❌ couldn't fetch that file from Telegram (bot download cap is 20 MB).",
+                msg_id, thread_id=thread_id,
+            )
+            return
+        note = (f"{caption}\n\n" if caption else "") + (
+            f"[The user sent a {kind} attachment. It is saved on this machine at: "
+            f"{info['path']} ({info['size']} bytes). Open or Read it as needed to act on it.]"
+        )
+        db.log_event(
+            self.daemon.conn, mission_id=mission_id, kind="user_file_received",
+            payload={"name": info["name"], "size": info["size"], "kind": kind},
+        )
+        await self._route_reply(client, chat_id, mission_id, note, msg_id, thread_id=thread_id)
+
     async def _route_reply(
         self, client: httpx.AsyncClient, chat_id: str, mission_id: str,
-        text: str, msg_id: int | None,
+        text: str, msg_id: int | None, thread_id: int | None = None,
     ) -> None:
-        """Route a Telegram reply to a worker's notify message back to that worker."""
+        """Route a user's Telegram message to a worker. Pins/banners immediately
+        for responsiveness, then BUFFERS the text: several messages fired within
+        a short window flush as ONE directive (see _buffer_reply), so the worker
+        wakes once with all of them instead of once per message.
+
+        When thread_id is set the message came from the mission's own forum
+        topic - the topic is the binding, so we route silently (no pin/banner).
+        """
+        in_topic = thread_id is not None
         m = self.daemon.conn.execute(
             "SELECT * FROM missions WHERE id = ?", (mission_id,)
         ).fetchone()
         if m is None:
-            self._pinned.pop(chat_id, None)
-            await self._send(client, chat_id, "❌ that mission no longer exists (conversation unpinned)", msg_id)
+            if not in_topic:
+                self._pinned.pop(chat_id, None)
+            await self._send(client, chat_id, "❌ that mission no longer exists (conversation unpinned)", msg_id, thread_id=thread_id)
             return
         state = m["state"]
-        # "Continuing" = this chat is already pinned to this mission. In that
-        # case we route silently (a 👀 reaction, no banner) - the worker's own
-        # notify reply is the response. The banner only shows when the pin is
-        # newly set or switched.
-        continuing = self._pinned.get(chat_id) == mission_id
+        # Terminal & non-reopenable: can't route.
+        if state in ("cancelled", "failed"):
+            if not in_topic:
+                self._pinned.pop(chat_id, None)
+            await self._send(
+                client, chat_id,
+                f"❌ mission *{m['name']}* is {state}; can't route a message to it.",
+                msg_id, thread_id=thread_id,
+            )
+            return
+        # Pin + banner immediately (DM only - topics bind by thread).
+        continuing = in_topic or self._pinned.get(chat_id) == mission_id
+        if not in_topic:
+            self._pinned[chat_id] = mission_id
+        if not continuing:
+            await self._send(
+                client, chat_id,
+                f"💬 now talking to *{m['name']}* - just type to continue (/unpin to stop).",
+                msg_id,
+            )
+        # Buffer; a single combined directive is delivered after the quiet window.
+        self._buffer_reply(client, mission_id, chat_id, thread_id, text)
+
+    def _buffer_reply(
+        self, client: httpx.AsyncClient, mission_id: str, chat_id: str,
+        thread_id: int | None, text: str,
+    ) -> None:
+        """Append a message to the mission's reply buffer and (on the first one)
+        start the coalescing window + typing indicator."""
+        first = mission_id not in self._reply_buf
+        self._reply_buf.setdefault(mission_id, []).append(text)
+        self._reply_ctx[mission_id] = (chat_id, thread_id)
+        if first:
+            self._start_typing(client, chat_id, mission_id, thread_id)
+            t = asyncio.create_task(self._flush_after(client, mission_id))
+            self._reply_timers[mission_id] = t
+            t.add_done_callback(lambda _t, mid=mission_id: self._reply_timers.pop(mid, None))
+
+    async def _flush_after(self, client: httpx.AsyncClient, mission_id: str) -> None:
+        try:
+            await asyncio.sleep(config.REPLY_COALESCE_S)
+        except asyncio.CancelledError:
+            return
+        try:
+            await self._flush_reply(client, mission_id)
+        except Exception:
+            log.exception("flush_reply failed for %s", mission_id)
+
+    async def _flush_reply(self, client: httpx.AsyncClient, mission_id: str) -> None:
+        """Deliver all buffered messages for a mission as one directive."""
+        texts = self._reply_buf.pop(mission_id, [])
+        chat_id, thread_id = self._reply_ctx.pop(mission_id, (None, None))
+        if not texts:
+            return
+        combined = texts[0] if len(texts) == 1 else "\n".join(f"• {t}" for t in texts)
+        m = self.daemon.conn.execute(
+            "SELECT * FROM missions WHERE id = ?", (mission_id,)
+        ).fetchone()
+        if m is None:
+            return
+        state = m["state"]
         directive = (
-            f"[The user is in a Telegram conversation with you and said]: {text}\n\n"
+            f"[The user is in a Telegram conversation with you and said]: {combined}\n\n"
             f"Act on this, then reply to the user via the `notify` tool with your response. "
             f"They may keep the conversation going, so be ready for follow-ups."
         )
-        if state == "running" or state == "cancelling":
-            self._pinned[chat_id] = mission_id
-            self.daemon.engine._enqueue_oob(
-                mission_id, {"kind": "user_reply", "directive": directive}
-            )
-            db.log_event(
-                self.daemon.conn, mission_id=mission_id, kind="user_reply_routed",
-            )
-            if not continuing:
-                await self._send(
-                    client, chat_id,
-                    f"💬 now talking to *{m['name']}* - just type to continue (/unpin to stop).",
-                    msg_id,
-                )
-            self._start_typing(client, chat_id, mission_id)
-            return
         if state == "completed":
             # Reopen, run the reply as a one-shot, finalize silently afterward.
             try:
                 runner.tmux_create_session(mission_id)
                 runner.write_worker_mcp_config(mission_id)
             except runner.RunnerError as e:
-                await self._send(client, chat_id, f"❌ reopen failed: {e}", msg_id)
+                if chat_id:
+                    await self._send(client, chat_id, f"❌ reopen failed: {e}", thread_id=thread_id)
                 return
             self.daemon.conn.execute(
                 "UPDATE missions SET state = 'running', finished_at = NULL,"
@@ -607,26 +806,15 @@ class TelegramHost:
                 (db.now_ts(), mission_id),
             )
             db.log_event(self.daemon.conn, mission_id=mission_id, kind="mission_reopened")
-            db.log_event(self.daemon.conn, mission_id=mission_id, kind="user_reply_routed")
             self.daemon.engine._suppress_wrapup.add(mission_id)
-            self._pinned[chat_id] = mission_id
-            self.daemon.engine._enqueue_oob(
-                mission_id, {"kind": "user_reply", "directive": directive}
-            )
-            if not continuing:
-                await self._send(
-                    client, chat_id,
-                    f"💬 now talking to *{m['name']}* - just type to continue (/unpin to stop).",
-                    msg_id,
-                )
-            self._start_typing(client, chat_id, mission_id)
-            return
-        # Terminal & non-reopenable (cancelled/failed): can't route.
-        self._pinned.pop(chat_id, None)
-        await self._send(
-            client, chat_id,
-            f"❌ mission *{m['name']}* is {state}; can't route a message to it (conversation unpinned).",
-            msg_id,
+        elif state not in ("running", "cancelling"):
+            return  # became terminal during the window → drop
+        self.daemon.engine._enqueue_oob(
+            mission_id, {"kind": "user_reply", "directive": directive}
+        )
+        db.log_event(
+            self.daemon.conn, mission_id=mission_id, kind="user_reply_routed",
+            payload={"messages": len(texts)},
         )
 
     async def _handle(
@@ -704,6 +892,7 @@ def _cmd_helptext(self: TelegramHost, args: list[str]) -> str:
     return (
         "*all commands*\n"
         "`/missions` - list all missions (also gives a button menu)\n"
+        "`/context` - all missions + their live context-token size\n"
         "`/m <id>` - mission detail with action buttons\n"
         "`/create <name>` - create mission\n"
         "`/step <id> <directive…>` - add a step (cue auto-detected)\n"
@@ -749,6 +938,48 @@ def _cmd_missions(self: TelegramHost, args: list[str]) -> Reply:
             f"`{_short(r['id'])}` {marker} {r['state']:10} {r['name']}"
         )
     return Reply(text="\n".join(lines), markup=_missions_list_kb(rows))
+
+
+def _cmd_context(self: TelegramHost, args: list[str]) -> Reply:
+    """List every mission with its current context-token size (what each wake
+    re-ingests), biggest first so bloat is obvious. Tap a mission to compact."""
+    rows = self.daemon.conn.execute(
+        "SELECT id, name, state FROM missions"
+        " ORDER BY (state = 'running') DESC, created_at DESC"
+    ).fetchall()
+    if not rows:
+        return Reply(text="_(no missions)_", markup=_ikb([[_btn("❓ help", "help")]]))
+    entries = []  # (tokens, turns, available, row)
+    for r in rows:
+        try:
+            ci = self._rpc("mission.context_info", {"mission_id": r["id"]})
+        except Exception:
+            ci = {"available": False}
+        if ci.get("available"):
+            entries.append((int(ci["context_tokens"]), int(ci["turns"]), True, r))
+        else:
+            entries.append((-1, 0, False, r))
+    # Biggest context first; missions with no transcript sink to the bottom.
+    entries.sort(key=lambda e: e[0], reverse=True)
+    lines = ["*context per mission* - tokens re-read on every wake"]
+    total = 0
+    for tokens, turns, available, r in entries[:40]:
+        marker = {
+            "running": "▶", "cancelling": "…",
+            "completed": "✓", "cancelled": "✗", "failed": "!",
+        }.get(r["state"], "?")
+        if not available:
+            lines.append(f"`{_short(r['id'])}` {marker} {r['name']} - _no transcript_")
+            continue
+        total += tokens
+        warn = " ⚠️" if tokens >= 200000 else ""
+        lines.append(
+            f"`{_short(r['id'])}` {marker} ~{tokens:,} ({turns} turns) {r['name']}{warn}"
+        )
+    lines.append("")
+    lines.append(f"*total live context:* ~{total:,} tokens")
+    lines.append("_tap a mission below, then 🗜 to compact a big one_")
+    return Reply(text="\n".join(lines), markup=_missions_list_kb(rows[:30]))
 
 
 def _cmd_get(self: TelegramHost, args: list[str]) -> Reply:
@@ -896,6 +1127,9 @@ _COMMANDS: dict[str, CommandFn] = {
     "helptext": _cmd_helptext,
     "start": _cmd_start,
     "missions": _cmd_missions,
+    "context": _cmd_context,
+    "tokens": _cmd_context,
+    "ctx": _cmd_context,
     "m": _cmd_get,
     "get": _cmd_get,
     "create": _cmd_create,

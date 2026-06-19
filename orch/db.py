@@ -123,10 +123,27 @@ def init_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE missions ADD COLUMN hold_until INTEGER NOT NULL DEFAULT 0")
     if "call_name" not in cols:
         conn.execute("ALTER TABLE missions ADD COLUMN call_name TEXT")
+    if "tg_topic_id" not in cols:
+        conn.execute("ALTER TABLE missions ADD COLUMN tg_topic_id INTEGER")
 
 
 def set_mission_call_name(conn: sqlite3.Connection, mission_id: str, name: str | None) -> None:
     conn.execute("UPDATE missions SET call_name = ? WHERE id = ?", (name, mission_id))
+
+
+def set_mission_topic(conn: sqlite3.Connection, mission_id: str, topic_id: int | None) -> None:
+    conn.execute(
+        "UPDATE missions SET tg_topic_id = ? WHERE id = ?",
+        (int(topic_id) if topic_id is not None else None, mission_id),
+    )
+
+
+def mission_for_topic(conn: sqlite3.Connection, topic_id: int) -> str | None:
+    """Which mission owns this forum topic (message_thread_id), if any."""
+    row = conn.execute(
+        "SELECT id FROM missions WHERE tg_topic_id = ?", (int(topic_id),)
+    ).fetchone()
+    return row["id"] if row else None
 
 
 def set_mission_hold(conn: sqlite3.Connection, mission_id: str, until_ts: int) -> None:

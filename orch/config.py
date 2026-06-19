@@ -112,10 +112,25 @@ ENV_SOCKET = "ORCH_SOCKET"
 # Inbound command bot (separate from the notification bot above).
 ENV_HOST_BOT_TOKEN = "ORCH_HOST_BOT_TOKEN"
 ENV_HOST_ALLOWED_CHATS = "ORCH_HOST_ALLOWED_CHAT_IDS"
+# Optional forum supergroup that hosts one Telegram Topic per mission. When set,
+# worker notify messages post into the mission's topic and replies typed in a
+# topic route to that mission's worker. The command bot must be an admin there
+# with Manage Topics.
+ENV_TOPICS_CHAT_ID = "ORCH_TOPICS_CHAT_ID"
+
+# Rapid user messages to the same mission within this many seconds are coalesced
+# into ONE directive, so the worker wakes once with all of them.
+REPLY_COALESCE_S = 5.0
 
 
 def default_chat_id() -> str | None:
     v = os.environ.get(ENV_DEFAULT_CHAT_ID)
+    return v.strip() if v and v.strip() else None
+
+
+def topics_chat_id() -> str | None:
+    """Forum supergroup id for per-mission topics, or None if topics mode off."""
+    v = os.environ.get(ENV_TOPICS_CHAT_ID)
     return v.strip() if v and v.strip() else None
 
 

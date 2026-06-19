@@ -762,10 +762,15 @@ HOW YOU RECEIVE WORK
   Each turn arrives as a directive (a user-style message). It may be a queued
   step, a heartbeat nudge, a status ping, a reply from the user, or a scheduled
   step you queued for yourself earlier. Do the work, then end your turn.
+  If the user sends an attachment, the directive includes a local file path -
+  Read/open it to act on it (it's already downloaded to this machine).
 
 THREE WAYS TO REACH PEOPLE - pick by audience and urgency:
   notify(text)              → the human USER, async text (Telegram). Progress,
                               results, anything they should see. Not urgent-only.
+  send_file(path,caption?)  → the human USER, a FILE over Telegram (image, PDF,
+                              screenshot, CSV, audio, any type). Use when they
+                              should SEE or download something, not just read text.
   talk_to_user(summary,q?)  → the human USER, a live PHONE call (via J-dawg).
                               Use ONLY for a real decision/blocker, OR urgent
                               escalation: imminent deadline, time-critical yes/no,
@@ -822,6 +827,23 @@ def _worker_tools() -> list[Tool]:
                 "Keep messages concise and include relevant context."
             ),
             inputSchema=_obj({"text": {"type": "string"}}, ["text"]),
+        ),
+        Tool(
+            name="send_file",
+            description=(
+                "Send a FILE to the user via Telegram (into this mission's chat) - an "
+                "image, PDF, screenshot, CSV, log, audio, video, any type. Pass an "
+                "absolute path to a file on this machine. Images show inline; other "
+                "types arrive as a downloadable document. Add an optional caption. "
+                "Max 50 MB. Use this when the user wants to SEE or download something, "
+                "not just read text.\n\n"
+                "Args: {path (required, absolute), caption (optional)}.\n"
+                "Example: {path: \"/tmp/chart.png\", caption: \"Here's the weekly chart.\"}"
+            ),
+            inputSchema=_obj(
+                {"path": {"type": "string"}, "caption": {"type": "string"}},
+                ["path"],
+            ),
         ),
         Tool(
             name="message_host",
@@ -979,6 +1001,12 @@ def build_worker_server(mission_id: str) -> Server:
         a = {**args, "mission_id": mission_id, "caller": "worker"}
         if name == "notify":
             return _text(_call("notify", {"mission_id": mission_id, "text": args.get("text", "")}))
+        if name == "send_file":
+            return _text(_call("notify_file", {
+                "mission_id": mission_id,
+                "path": args.get("path", ""),
+                "caption": args.get("caption", ""),
+            }))
         if name == "message_host":
             return _text(_call("host.message", {
                 "mission_id": mission_id,

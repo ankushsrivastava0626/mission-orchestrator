@@ -273,7 +273,41 @@ def h_mission_create(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
         heartbeat_interval_s=interval,
     )
     db.log_event(d.conn, mission_id=mission_id, kind="mission_created")
+    # Topics: either bind to a pre-existing topic the user just created in the
+    # app (tg_topic_id given), or auto-create one for this mission.
+    preset_topic = p.get("tg_topic_id")
+    if preset_topic is not None:
+        db.set_mission_topic(d.conn, mission_id, int(preset_topic))
+        db.log_event(
+            d.conn, mission_id=mission_id, kind="topic_bound",
+            payload={"topic_id": int(preset_topic)},
+        )
+    else:
+        _ensure_mission_topic(d, mission_id, str(name))
     return {"mission_id": mission_id}
+
+
+def _ensure_mission_topic(d: Daemon, mission_id: str, name: str) -> None:
+    """Create (if needed) the per-mission forum topic and store its id. No-op
+    when topics mode is off, the command bot is unset, or a topic already
+    exists. Never raises - topic failures must not block mission work."""
+    topics_chat = config.topics_chat_id()
+    tok = telegram.host_token()
+    if not topics_chat or not tok:
+        return
+    m = db.get_mission(d.conn, mission_id)
+    if m is None or ("tg_topic_id" in m.keys() and m["tg_topic_id"]):
+        return
+    try:
+        tid = telegram.create_forum_topic(tok, topics_chat, name)
+        if tid is not None:
+            db.set_mission_topic(d.conn, mission_id, tid)
+            db.log_event(
+                d.conn, mission_id=mission_id, kind="topic_created",
+                payload={"topic_id": tid},
+            )
+    except Exception:
+        log.exception("topic creation failed for %s", mission_id)
 
 
 def h_mission_list(d: Daemon, p: dict[str, Any]) -> list[dict[str, Any]]:
@@ -316,23 +350,40 @@ def _session_jsonl(mission_id: str) -> str | None:
 
 
 def _context_tokens(path: str) -> tuple[int, int]:
-    """(last-turn context tokens, turn count) from a session jsonl."""
+    """(effective context tokens for the next resume, turn count).
+
+    Normally this is the last non-zero `usage` block. But `/compact` rewrites
+    the conversation down to a summary WITHOUT emitting a new usage block, so
+    after a compaction the last historical usage is stale (it reflects the
+    huge pre-compact context). When a compact-summary boundary appears AFTER
+    the last usage line, the real next-resume context is just the summary plus
+    whatever follows it - estimate that from bytes-since-boundary (~4 chars per
+    token) instead of reporting the stale pre-compact number."""
     import json as _json
     last = 0
-    turns = 0
+    last_usage_i = -1
+    last_compact_i = -1
+    lines: list[str] = []
     with open(path) as fh:
-        for line in fh:
-            turns += 1
+        for i, line in enumerate(fh):
+            lines.append(line)
             try:
                 o = _json.loads(line)
             except Exception:
                 continue
+            if o.get("isCompactSummary"):
+                last_compact_i = i
             u = (o.get("message") or {}).get("usage") or {}
             tot = ((u.get("input_tokens") or 0)
                    + (u.get("cache_read_input_tokens") or 0)
                    + (u.get("cache_creation_input_tokens") or 0))
             if tot > 0:
                 last = tot
+                last_usage_i = i
+    turns = len(lines)
+    if last_compact_i >= 0 and last_compact_i > last_usage_i:
+        chars = sum(len(lines[j]) for j in range(last_compact_i, len(lines)))
+        return chars // 4, turns
     return last, turns
 
 
@@ -373,13 +424,24 @@ def h_mission_compact(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     # Claude keys sessions by project = cwd. Orch worker sessions live under
     # ~/.claude/projects/-/ (cwd "/"), so --resume only finds them from "/".
     # Run the compact from there, with stdin closed (/compact takes no input).
+    # Capture stdout+stderr to a per-mission log so we can see WHY a compact
+    # did or didn't take (the process is detached; this is our only window).
+    logpath = os.path.expanduser(f"~/.orch/compact-{mission_id}.log")
+    logf = open(logpath, "ab")
+    logf.write(f"\n=== compact start mid={mission_id} before_tokens={before} "
+               f"bin={claude_bin} ===\n".encode())
+    logf.flush()
     subprocess.Popen(
         [claude_bin, "--resume", mission_id, "--dangerously-skip-permissions",
-         "-p", "/compact"],
+         "--verbose", "-p", "/compact"],
         stdin=subprocess.DEVNULL,
-        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        stdout=logf, stderr=subprocess.STDOUT,
         start_new_session=True, cwd="/",
-        env={**os.environ, "PATH": os.environ.get("PATH", "") + ":/root/.local/bin"},
+        # IS_SANDBOX=1 is the override that lets --dangerously-skip-permissions
+        # run as root (the tmux server sets it for workers; the daemon's own
+        # environ does not, so set it explicitly here).
+        env={**os.environ, "PATH": os.environ.get("PATH", "") + ":/root/.local/bin",
+             "IS_SANDBOX": "1"},
     )
     db.log_event(
         d.conn, mission_id=mission_id, kind="compact_started",
@@ -993,13 +1055,24 @@ def h_notify(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     if len(text) > 4000:
         text = text[:3990] + "…"
     chat_id = m["telegram_chat_id"]
+    # Topics mode: if this mission has its own forum topic, post there (scoped
+    # thread) instead of the flat DM. The worker is oblivious - same notify call,
+    # the daemon just adds the message_thread_id.
+    topics_chat = config.topics_chat_id()
+    topic_id = m["tg_topic_id"] if "tg_topic_id" in m.keys() else None
     # Prefer the command bot (bot #2) so the user can reply to this message and
     # have the reply routed back to this worker. Fall back to the notification
     # bot (bot #1) if the command bot isn't configured.
     host_tok = telegram.host_token()
     routed = "host_bot"
     if host_tok:
-        msg_id = telegram.send_via(host_tok, chat_id, text)
+        if topics_chat and topic_id:
+            msg_id = telegram.send_via(
+                host_tok, topics_chat, text, message_thread_id=int(topic_id)
+            )
+            routed = "topic"
+        else:
+            msg_id = telegram.send_via(host_tok, chat_id, text)
         if msg_id is not None:
             db.map_notify_message(d.conn, msg_id, mission_id)
         else:
@@ -1012,6 +1085,43 @@ def h_notify(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
         payload={"chars": len(text), "via": routed},
     )
     return {"ok": True}
+
+
+def h_notify_file(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Send a local file (image or any type) from the worker to the user, into
+    the mission's topic (or its DM as fallback). Worker passes a path + caption."""
+    mission_id, path = _require(p, "mission_id", "path")
+    m = _mission_or_raise(d.conn, mission_id)
+    caption = str(p.get("caption") or "")
+    src = os.path.expanduser(str(path))
+    if not os.path.isfile(src):
+        raise RPCError("not_found", f"file not found: {src}")
+    size = os.path.getsize(src)
+    if size > 50 * 1024 * 1024:
+        raise RPCError("too_big", f"file is {size//1048576}MB; Telegram bot upload cap is 50MB")
+    host_tok = telegram.host_token()
+    if not host_tok:
+        raise RPCError("no_bot", "command bot token not configured")
+    topics_chat = config.topics_chat_id()
+    topic_id = m["tg_topic_id"] if "tg_topic_id" in m.keys() else None
+    if topics_chat and topic_id:
+        msg_id = telegram.send_file_via(
+            host_tok, topics_chat, src, caption or None, message_thread_id=int(topic_id)
+        )
+        routed = "topic"
+    else:
+        msg_id = telegram.send_file_via(host_tok, str(m["telegram_chat_id"]), src, caption or None)
+        routed = "dm"
+    if msg_id is not None:
+        db.map_notify_message(d.conn, msg_id, mission_id)
+    db.log_event(
+        d.conn, mission_id=mission_id, kind="notify_file_sent",
+        payload={"name": os.path.basename(src), "size": size, "via": routed,
+                 "ok": msg_id is not None},
+    )
+    if msg_id is None:
+        raise RPCError("send_failed", "Telegram rejected the upload (see daemon log)")
+    return {"ok": True, "message_id": msg_id}
 
 
 def h_mission_hold(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
@@ -1139,6 +1249,7 @@ def h_defaults_get(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
 _HANDLERS: dict[str, Handler] = {
     "defaults.get": h_defaults_get,
     "notify": h_notify,
+    "notify_file": h_notify_file,
     "mission.hold": h_mission_hold,
     "host.message": h_host_message,
     "host.inbox": h_host_inbox,
