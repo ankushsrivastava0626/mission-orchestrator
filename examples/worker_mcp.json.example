@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "playwright": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["@playwright/mcp@latest", "--user-data-dir", "/tmp/orch-{mission_id}/pw-profile"],
+      "env": {}
+    },
+    "talk-to-user": {
+      "type": "stdio",
+      "command": "/usr/bin/python3",
+      "args": ["/root/jdawg/jdawg_mcp.py", "--mission-id", "{mission_id}"],
+      "env": {}
+    }
+  }
+}

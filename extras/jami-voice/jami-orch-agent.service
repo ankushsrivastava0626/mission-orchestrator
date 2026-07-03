@@ -1,0 +1,19 @@
+[Unit]
+Description=J-dawg Jami voice agent (orch worker phone escalations + inbound calls)
+After=network-online.target orchd.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+Environment=HOME=/root
+Environment=XDG_RUNTIME_DIR=/run/user/0
+WorkingDirectory=/root/jami-moshi
+ExecStart=/root/jami-moshi/ppvenv/bin/python agent_jami_orch.py
+Restart=always
+RestartSec=5s
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

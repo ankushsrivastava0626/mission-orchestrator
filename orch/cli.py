@@ -21,9 +21,24 @@ def daemon_cli() -> None:
     """Orchestrator daemon."""
 
 
+@daemon_cli.command("setup")
+def daemon_setup() -> None:
+    """Interactive first-run setup (agent backend, Telegram, vault, service)."""
+    from . import setup_wizard
+    setup_wizard.run_wizard()
+
+
 @daemon_cli.command("start")
 def daemon_start() -> None:
     """Start the daemon in the foreground."""
+    from . import setup_wizard
+    # First start on a fresh machine: offer the wizard (interactive TTY only).
+    if (not setup_wizard.ENV_PATH.exists()
+            and not os.path.exists("/etc/orchd.env")
+            and sys.stdin.isatty()):
+        click.echo("no config found - running first-time setup (orchd setup).")
+        setup_wizard.run_wizard()
+        config._load_env_file()
     if not os.environ.get(config.ENV_MASTER_PASSPHRASE):
         click.echo(
             f"warning: {config.ENV_MASTER_PASSPHRASE} not set; vault operations will fail",

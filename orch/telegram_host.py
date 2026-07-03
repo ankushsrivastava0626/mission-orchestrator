@@ -26,7 +26,7 @@ from typing import Any, Awaitable, Callable
 
 import httpx
 
-from . import config, db, runner, telegram
+from . import agents, config, db, runner, telegram
 
 log = logging.getLogger(__name__)
 
@@ -255,11 +255,23 @@ class TelegramHost:
                 if (self.topics_chat_id and chat_id == self.topics_chat_id
                         and thread_id):
                     tmid = db.mission_for_topic(self.daemon.conn, thread_id)
+                    log.info(
+                        "telegram_host: topic msg thread=%s -> mission=%s",
+                        thread_id, tmid,
+                    )
                     if tmid is not None:
                         await self._route_reply(
                             client, chat_id, tmid, text, msg_id, thread_id=thread_id
                         )
-                    # Unknown topic (e.g. a manual one) → ignore silently.
+                    else:
+                        # Unknown topic - say so instead of eating the message.
+                        await self._send(
+                            client, chat_id,
+                            "🤷 this topic isn't bound to any mission, so nobody is "
+                            "listening here. Create a new topic to spawn a mission, "
+                            "or use a mission's own topic.",
+                            msg_id, thread_id=thread_id,
+                        )
                     continue
                 # 1. Reply to a mapped worker/prompt message → route + pin the
                 #    conversation to that mission.
@@ -393,8 +405,9 @@ class TelegramHost:
         if not info.get("available"):
             tok_line = "context size: unknown (no transcript yet)"
         else:
+            mb = f", {info['transcript_mb']} MB" if info.get("transcript_mb") is not None else ""
             tok_line = (f"context now: *{info['context_tokens']:,} tokens* "
-                        f"({info['turns']} turns, {info['transcript_mb']} MB) - "
+                        f"({info['turns']} turns{mb}) - "
                         f"re-read on every wake")
         try:
             r = self._rpc("mission.compact", {"mission_id": mid})
@@ -795,7 +808,7 @@ class TelegramHost:
             # Reopen, run the reply as a one-shot, finalize silently afterward.
             try:
                 runner.tmux_create_session(mission_id)
-                runner.write_worker_mcp_config(mission_id)
+                agents.get_adapter().prepare(mission_id)
             except runner.RunnerError as e:
                 if chat_id:
                     await self._send(client, chat_id, f"❌ reopen failed: {e}", thread_id=thread_id)

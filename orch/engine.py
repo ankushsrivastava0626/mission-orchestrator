@@ -24,6 +24,9 @@ class Engine:
         # idle tick (used for reply-driven one-shot interactions, where the
         # worker has already responded to the user via notify).
         self._suppress_wrapup: set[str] = set()
+        # Per-mission timestamp of the last (throttled) context-size check for
+        # auto-compaction.
+        self._last_ctx_check: dict[str, int] = {}
 
     def stop(self) -> None:
         self._stop.set()
@@ -115,6 +118,13 @@ class Engine:
 
         # 4b. Scripted-ping watchdog: re-task the worker to repair silent scripts.
         self._tick_scripted_pings(mission_id, now)
+
+        # 4c. Auto-compact a bloated session while the worker is fully idle. If
+        # it fires, skip the rest of this tick so we never resume the session
+        # for a step in the same moment the compact process resumes it.
+        if running is None and not claude_busy and not self._pending_oob.get(mission_id):
+            if self._maybe_auto_compact(m, now):
+                return
 
         # 5. Pop next pending step if its cue is satisfied AND claude is idle.
         if running is None and not claude_busy and not self._pending_oob.get(mission_id):
@@ -292,6 +302,59 @@ class Engine:
             payload={"mode": "soft"},
         )
         log.info("mission %s soft-cancelled (goodbye delivered)", mission_id)
+
+    # ---------- auto-compaction ----------
+
+    def _maybe_auto_compact(self, m: sqlite3.Row, now: int) -> bool:
+        """If an idle worker's context has crossed the threshold, fire a headless
+        /compact. Returns True if a compaction was started this tick.
+
+        Caller guarantees the worker is idle with no pending OOB. We additionally
+        require no pending/running steps so we never collide with a step launch,
+        and `step_running` being false also means no compact is already in
+        flight (the compact process is itself a `claude --resume <id>`)."""
+        if config.AUTO_COMPACT_THRESHOLD <= 0:
+            return False
+        from . import agents
+        adapter = agents.get_adapter()
+        if not adapter.supports_compact:
+            return False
+        mission_id = m["id"]
+        # Cheap gates first (don't spend the throttle window on a busy mission).
+        if runner.step_running(mission_id):
+            return False
+        if self.conn.execute(
+            "SELECT 1 FROM steps WHERE mission_id = ? AND state IN ('pending','running') LIMIT 1",
+            (mission_id,),
+        ).fetchone():
+            return False
+        # Throttle the (file-reading) size measurement.
+        if now - self._last_ctx_check.get(mission_id, 0) < config.AUTO_COMPACT_CHECK_S:
+            return False
+        self._last_ctx_check[mission_id] = now
+        ct = adapter.context_tokens(mission_id)
+        if ct is None:
+            return False
+        tokens = ct[0]
+        if tokens < config.AUTO_COMPACT_THRESHOLD:
+            return False
+        # Cooldown: don't re-fire while a recent compaction is still settling
+        # (the size reading lags until the worker takes its next turn).
+        recent = self.conn.execute(
+            "SELECT 1 FROM events WHERE mission_id = ? AND kind = 'compact_started'"
+            " AND ts >= ? LIMIT 1",
+            (mission_id, now - config.AUTO_COMPACT_COOLDOWN_S),
+        ).fetchone()
+        if recent is not None:
+            return False
+        adapter.compact(mission_id)
+        db.log_event(
+            self.conn, mission_id=mission_id, kind="compact_started",
+            payload={"before_tokens": tokens, "auto": True,
+                     "threshold": config.AUTO_COMPACT_THRESHOLD},
+        )
+        log.info("auto-compact: mission %s at ~%d tokens", mission_id, tokens)
+        return True
 
     # ---------- mission completion ----------
 

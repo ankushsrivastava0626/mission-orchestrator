@@ -1,6 +1,7 @@
 [project]
 name = "mission-orchestrator"
-version = "0.1.0"
+version = "0.22.0"
+description = "orch - delegate long-running, stateful missions to AI worker agents (Claude Code, Codex, Gemini, or raw API keys) with Telegram control"
 requires-python = ">=3.11"
 dependencies = [
   "mcp>=1.27,<2",

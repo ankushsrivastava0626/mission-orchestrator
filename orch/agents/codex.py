@@ -1,0 +1,75 @@
+"""OpenAI Codex CLI backend.
+
+Isolation trick: each mission gets its own CODEX_HOME (under the mission's
+tmp dir) so its rollout/session store is private - `codex exec resume --last`
+is then unambiguous per mission, and no session-id discovery is needed.
+Auth is shared by symlinking auth.json from the real ~/.codex.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+from pathlib import Path
+
+from .base import Adapter
+from .. import config
+
+CODEX_BIN = os.environ.get("ORCH_CODEX_BIN", "codex")
+
+
+class CodexAdapter(Adapter):
+    name = "codex"
+
+    def _home(self, mission_id: str) -> Path:
+        return config.worker_tmpdir(mission_id) / "codex-home"
+
+    def prepare(self, mission_id: str) -> None:
+        home = self._home(mission_id)
+        home.mkdir(parents=True, exist_ok=True)
+        # Share the user's Codex auth with the per-mission home.
+        real = Path(os.path.expanduser("~/.codex"))
+        for fname in ("auth.json",):
+            src, dst = real / fname, home / fname
+            if src.exists() and not dst.exists():
+                try:
+                    dst.symlink_to(src)
+                except OSError:
+                    pass
+        # Per-mission config: orch worker MCP + any extra shared MCP servers.
+        from ..runner import _load_extra_worker_mcps
+        servers: dict = {
+            "orch": {
+                "command": "orch-mcp",
+                "args": ["--mode", "worker", "--mission-id", mission_id],
+                "env": {
+                    config.ENV_MISSION_ID: mission_id,
+                    config.ENV_SOCKET: str(config.SOCKET_PATH),
+                },
+            }
+        }
+        servers.update(_load_extra_worker_mcps(mission_id))
+        lines = []
+        for name, s in servers.items():
+            lines.append(f'[mcp_servers.{name}]')
+            lines.append(f'command = {json.dumps(s.get("command", ""))}')
+            lines.append(f'args = {json.dumps(s.get("args", []))}')
+            env = s.get("env") or {}
+            if env:
+                lines.append(f'[mcp_servers.{name}.env]')
+                for k, v in env.items():
+                    lines.append(f'{k} = {json.dumps(str(v))}')
+        (home / "config.toml").write_text("\n".join(lines) + "\n")
+
+    def step_cmd(self, mission_id: str, directive: str, first: bool) -> str:
+        home = self._home(mission_id)
+        sub = "exec" if first else "exec resume --last"
+        # ORCH_MISSION_ID in the env keeps the mission id visible to pgrep.
+        return (
+            f"env CODEX_HOME={self.q(str(home))} ORCH_MISSION_ID={mission_id}"
+            f" {CODEX_BIN} {sub} --dangerously-bypass-approvals-and-sandbox"
+            f" --skip-git-repo-check {self.q(directive)}"
+        )
+
+    def is_running_line(self, line: str, mission_id: str) -> bool:
+        return "codex" in line and mission_id in line

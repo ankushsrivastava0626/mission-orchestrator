@@ -10,7 +10,7 @@ import signal
 import sqlite3
 from typing import Any, Awaitable, Callable
 
-from . import config, db, engine, runner, telegram, telegram_host, vault
+from . import agents, config, db, engine, runner, telegram, telegram_host, vault
 
 log = logging.getLogger(__name__)
 
@@ -263,7 +263,7 @@ def h_mission_create(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
         runner.tmux_create_session(mission_id)
     except runner.RunnerError as e:
         raise RPCError("tmux_failed", str(e))
-    runner.write_worker_mcp_config(mission_id)
+    agents.get_adapter().prepare(mission_id)
     db.create_mission(
         d.conn,
         mission_id=mission_id,
@@ -342,110 +342,49 @@ def h_mission_set_call_name(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "call_name": name}
 
 
-def _session_jsonl(mission_id: str) -> str | None:
-    import glob
-    base = os.path.expanduser("~/.claude/projects")
-    hits = glob.glob(f"{base}/*/{mission_id}.jsonl")
-    return hits[0] if hits else None
-
-
-def _context_tokens(path: str) -> tuple[int, int]:
-    """(effective context tokens for the next resume, turn count).
-
-    Normally this is the last non-zero `usage` block. But `/compact` rewrites
-    the conversation down to a summary WITHOUT emitting a new usage block, so
-    after a compaction the last historical usage is stale (it reflects the
-    huge pre-compact context). When a compact-summary boundary appears AFTER
-    the last usage line, the real next-resume context is just the summary plus
-    whatever follows it - estimate that from bytes-since-boundary (~4 chars per
-    token) instead of reporting the stale pre-compact number."""
-    import json as _json
-    last = 0
-    last_usage_i = -1
-    last_compact_i = -1
-    lines: list[str] = []
-    with open(path) as fh:
-        for i, line in enumerate(fh):
-            lines.append(line)
-            try:
-                o = _json.loads(line)
-            except Exception:
-                continue
-            if o.get("isCompactSummary"):
-                last_compact_i = i
-            u = (o.get("message") or {}).get("usage") or {}
-            tot = ((u.get("input_tokens") or 0)
-                   + (u.get("cache_read_input_tokens") or 0)
-                   + (u.get("cache_creation_input_tokens") or 0))
-            if tot > 0:
-                last = tot
-                last_usage_i = i
-    turns = len(lines)
-    if last_compact_i >= 0 and last_compact_i > last_usage_i:
-        chars = sum(len(lines[j]) for j in range(last_compact_i, len(lines)))
-        return chars // 4, turns
-    return last, turns
-
-
 def h_mission_context_info(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
-    """Live context size of a mission's worker session - what each wake re-ingests."""
+    """Live context size of a mission's worker session - what each wake re-ingests.
+    Delegated to the active agent adapter; not every backend can measure it."""
+    from . import agents
     (mission_id,) = _require(p, "mission_id")
     _mission_or_raise(d.conn, mission_id)
-    path = _session_jsonl(mission_id)
-    if not path:
-        return {"available": False}
-    tokens, turns = _context_tokens(path)
-    size = os.path.getsize(path)
-    return {
-        "available": True,
-        "context_tokens": tokens,
-        "turns": turns,
-        "transcript_bytes": size,
-        "transcript_mb": round(size / 1048576, 2),
+    adapter = agents.get_adapter()
+    ct = adapter.context_tokens(mission_id)
+    if ct is None:
+        return {"available": False, "agent": adapter.name}
+    tokens, turns = ct
+    out: dict[str, Any] = {
+        "available": True, "agent": adapter.name,
+        "context_tokens": tokens, "turns": turns,
     }
+    path = adapter.session_path(mission_id)
+    if path and os.path.isfile(path):
+        size = os.path.getsize(path)
+        out["transcript_bytes"] = size
+        out["transcript_mb"] = round(size / 1048576, 2)
+    return out
 
 
 def h_mission_compact(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
-    """Compact a mission's worker session (headless `claude --resume -p /compact`),
-    so future wakes re-ingest a small summary instead of the whole transcript.
-    Runs detached; returns immediately with the pre-compaction size."""
-    import subprocess
+    """Compact a mission's worker session so future wakes re-ingest a small
+    summary instead of the whole transcript. Runs detached; returns immediately
+    with the pre-compaction size. Unsupported on some agent backends."""
+    from . import agents
     (mission_id,) = _require(p, "mission_id")
     _mission_or_raise(d.conn, mission_id)
+    adapter = agents.get_adapter()
+    if not adapter.supports_compact:
+        raise RPCError("unsupported",
+                       f"the {adapter.name} backend doesn't support compaction")
     if runner.step_running(mission_id):
         raise RPCError("busy", "the worker is mid-turn; try again when idle")
-    path = _session_jsonl(mission_id)
-    before = _context_tokens(path)[0] if path else 0
-    # Resolve claude's absolute path (daemon runs under systemd's minimal PATH).
-    import shutil
-    claude_bin = (shutil.which("claude")
-                  or os.path.expanduser("~/.local/bin/claude")
-                  or "claude")
-    # Claude keys sessions by project = cwd. Orch worker sessions live under
-    # ~/.claude/projects/-/ (cwd "/"), so --resume only finds them from "/".
-    # Run the compact from there, with stdin closed (/compact takes no input).
-    # Capture stdout+stderr to a per-mission log so we can see WHY a compact
-    # did or didn't take (the process is detached; this is our only window).
-    logpath = os.path.expanduser(f"~/.orch/compact-{mission_id}.log")
-    logf = open(logpath, "ab")
-    logf.write(f"\n=== compact start mid={mission_id} before_tokens={before} "
-               f"bin={claude_bin} ===\n".encode())
-    logf.flush()
-    subprocess.Popen(
-        [claude_bin, "--resume", mission_id, "--dangerously-skip-permissions",
-         "--verbose", "-p", "/compact"],
-        stdin=subprocess.DEVNULL,
-        stdout=logf, stderr=subprocess.STDOUT,
-        start_new_session=True, cwd="/",
-        # IS_SANDBOX=1 is the override that lets --dangerously-skip-permissions
-        # run as root (the tmux server sets it for workers; the daemon's own
-        # environ does not, so set it explicitly here).
-        env={**os.environ, "PATH": os.environ.get("PATH", "") + ":/root/.local/bin",
-             "IS_SANDBOX": "1"},
-    )
+    ct = adapter.context_tokens(mission_id)
+    before = ct[0] if ct else 0
+    if not adapter.compact(mission_id):
+        raise RPCError("compact_failed", "backend refused to start a compaction")
     db.log_event(
         d.conn, mission_id=mission_id, kind="compact_started",
-        payload={"before_tokens": before},
+        payload={"before_tokens": before, "auto": False},
     )
     return {"ok": True, "started": True, "before_tokens": before}
 
@@ -643,7 +582,7 @@ def h_step_add(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     if m["state"] == "completed":
         try:
             runner.tmux_create_session(mission_id)
-            runner.write_worker_mcp_config(mission_id)
+            agents.get_adapter().prepare(mission_id)
         except runner.RunnerError as e:
             raise RPCError("reopen_failed", str(e))
         d.conn.execute(
@@ -698,7 +637,7 @@ def h_oob_inject(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     if m["state"] == "completed":
         try:
             runner.tmux_create_session(mission_id)
-            runner.write_worker_mcp_config(mission_id)
+            agents.get_adapter().prepare(mission_id)
         except runner.RunnerError as e:
             raise RPCError("reopen_failed", str(e))
         d.conn.execute(

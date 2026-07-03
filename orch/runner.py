@@ -184,33 +184,19 @@ def cleanup_worker_tmp(mission_id: str) -> None:
         subprocess.run(["rm", "-rf", str(tmp)], capture_output=True)
 
 
-# ---------- claude invocation ----------
-
-
-def _build_claude_cmd(
-    mission_id: str, directive: str, *, first_step: bool, mcp_config: Path
-) -> str:
-    if first_step:
-        flag = f"--session-id {shlex.quote(mission_id)}"
-    else:
-        flag = f"--resume {shlex.quote(mission_id)}"
-    return (
-        f"{CLAUDE_BIN} {flag} --mcp-config {shlex.quote(str(mcp_config))}"
-        f" --dangerously-skip-permissions"
-        f" --print {shlex.quote(directive)}"
-    )
+# ---------- agent invocation (via the configured adapter) ----------
 
 
 def launch_step(
     mission_id: str, directive: str, *, first_step: bool
 ) -> None:
+    from . import agents
+    adapter = agents.get_adapter()
     session = config.tmux_session_name(mission_id)
     if not tmux_session_exists(session):
         tmux_create_session(mission_id)
-    mcp_config = write_worker_mcp_config(mission_id)
-    cmd = _build_claude_cmd(
-        mission_id, directive, first_step=first_step, mcp_config=mcp_config
-    )
+    adapter.prepare(mission_id)
+    cmd = adapter.step_cmd(mission_id, directive, first_step)
     tmux_send(session, cmd)
 
 
@@ -220,24 +206,31 @@ def launch_oob(mission_id: str, directive: str) -> None:
 
 
 def step_running(mission_id: str) -> bool:
-    """Is a claude process for this mission's session id currently running?
+    """Is a worker-agent process for this mission currently running?
 
     Uses pgrep against the full command line so the answer survives a human
     attaching to the tmux pane and running other commands (which would fool
-    a foreground-command check).
+    a foreground-command check). Every adapter guarantees the mission id
+    appears on its worker's command line; the adapter validates the hit so a
+    process that merely *mentions* the id (e.g. a grep) doesn't false-match.
     """
-    # Match only a real claude invocation for this session: `--resume <id>` or
-    # `--session-id <id>`. The old `claude .*<id>` pattern false-matched any
-    # process whose cmdline merely contained '.claude/...' AND the id (e.g. a
-    # shell using the .claude snapshot path while referencing the mission id).
+    from . import agents
+    adapter = agents.get_adapter()
     try:
         res = subprocess.run(
-            ["pgrep", "-af", f"(resume|session-id) {mission_id}"],
+            ["pgrep", "-af", mission_id],
             capture_output=True,
         )
     except FileNotFoundError:
         return False
     for line in res.stdout.decode("utf-8", "replace").splitlines():
-        if "claude" in line and ("--resume " in line or "--session-id " in line):
+        # Ignore our own pgrep and shell wrappers quoting the id.
+        if "pgrep" in line:
+            continue
+        if adapter.is_running_line(line, mission_id):
             return True
     return False
+
+
+# Session-size and compaction logic lives in each agent adapter
+# (orch/agents/*) - the backend owns its transcript format.

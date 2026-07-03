@@ -1,72 +1,96 @@
-# mission-orchestrator
+# orch - mission orchestrator for AI agents
 
-A Python daemon + MCP server that lets a "host" Claude Code delegate long-running tasks to a "worker" Claude Code on this machine running inside a tmux session.
+Delegate long-running, stateful jobs ("missions") to AI worker agents that run
+unattended on your machine - each in its own tmux session with persistent
+memory - and control the whole fleet from Telegram: every mission gets its own
+chat topic, agents message you, you message them back, they phone you (voice
+extra) when something truly needs you.
 
-## Pieces
+Works with **any coding agent**:
 
-- `orchd` - long-running daemon. Owns SQLite at `~/.orch/orch.db`, manages tmux sessions, spawns `claude --resume` per Step, runs the cue engine and scheduler. RPC over `~/.orch/orchd.sock`.
-- `orch-mcp` - stdio MCP server. Two modes:
-  - `orch-mcp --mode host` - exposes the full tool surface (`mission.*`, `step.*`, `ping.*`, `heartbeat.*`, `secret.*`, `cookies.*`).
-  - `orch-mcp --mode worker --mission-id <id>` - scoped tool surface for the worker Claude inside the mission's tmux.
-- `orchctl` - admin CLI talking to the daemon socket (missions, step-add, cancel, etc.).
-- `msec` - used by the worker Claude inside the mission tmux to read secrets and materialize cookie files.
+| backend  | runs on                              | resume | compact | notes |
+|----------|--------------------------------------|--------|---------|-------|
+| `claude` | Claude Code CLI                      | ✓      | ✓       | richest support (default) |
+| `codex`  | OpenAI Codex CLI                     | ✓      | -       | per-mission CODEX_HOME isolation |
+| `gemini` | Gemini CLI                           | ✓      | -       | per-mission workdir isolation |
+| `api`    | **no CLI - just an API key**         | ✓      | ✓       | Anthropic or any OpenAI-compatible endpoint (OpenAI, OpenRouter, Ollama, …) |
+| `custom` | any agent CLI via command templates  | you    | -       | plug in anything |
 
 ## Install
 
-```
-pip install -e /root/mission-orchestrator
-```
-
-Required system packages: `tmux`, `gpg`, `pass`, `claude`.
-
-## Run
-
-```
-export ORCH_MASTER_PASSPHRASE=<a-strong-passphrase>
-export ORCH_TELEGRAM_BOT_TOKEN=<notification-bot-token>      # outbound: worker.notify -> Telegram
-export ORCH_DEFAULT_CHAT_ID=<your-chat-id>                   # default chat for mission.create
-# Optional: inbound /command interface on a SEPARATE bot
-export ORCH_HOST_BOT_TOKEN=<command-bot-token>               # must be a different bot from above
-export ORCH_HOST_ALLOWED_CHAT_IDS=<comma-separated-chat-ids> # who's allowed to send /commands
-orchd start
+```bash
+git clone <this repo> orch && cd orch
+./install.sh          # checks deps, installs CLIs, runs the setup wizard
 ```
 
-If `ORCH_HOST_BOT_TOKEN` and `ORCH_HOST_ALLOWED_CHAT_IDS` are set, orchd will long-poll that bot and accept commands like `/missions`, `/m <id>`, `/step <id> <directive>`, `/cancel <id>`, `/pane <id>`, `/events <id>`, `/secret <id> <name> <value>`, `/heartbeat <id> <s>`, `/delete <id>`, `/help`. Send `/help` in the bot DM for the full list. The bot used here MUST be different from the notification bot - Telegram only allows one polling consumer per bot.
+Requirements: Linux or macOS (Windows → WSL), Python ≥ 3.11, `tmux`.
+Optional: `pass`+GPG (secrets vault), systemd (run-at-boot service).
 
-On first start, `orchd` generates a GPG key (`orch-vault`, `orch@localhost`) and initializes the `pass` store under `~/.password-store/` if not already initialized.
+The wizard (`orchd setup`, also auto-offered on first `orchd start`) asks for:
+your agent backend, a Telegram bot token (it auto-detects your chat id when
+you message the bot), an optional Topics group, and a vault passphrase - then
+writes `~/.orch/orchd.env` and can install the systemd service.
 
-## MCP wiring (host Claude)
+## Concepts (90 seconds)
 
-Add to your host's `.mcp.json`:
+- **Mission** - one persistent worker-agent session in one tmux. Survives
+  reboots; resumes with full context on every wake.
+- **Step** - a directive in the mission's linear queue, gated by a **cue**:
+  `immediate`, `on_current_complete` (jump the queue), `on_timeout`,
+  `at_time` (absolute wall-clock - workers self-schedule future work).
+- **Heartbeat** - periodic "report status to the user" nudge (default daily).
+- **Scripted ping** - the worker writes+tests a tiny watcher script that polls
+  some condition with **zero tokens** and only wakes the agent when it fires
+  (a watchdog re-tasks the worker if the script dies).
+- **Auto-compaction** - when an idle worker's context crosses 200k tokens the
+  daemon compacts the session so future wakes stay cheap.
+- **Vault** - per-mission secrets in `pass`; workers read them with `msec`.
 
-```json
-{
-  "mcpServers": {
-    "orch": {
-      "command": "orch-mcp",
-      "args": ["--mode", "host"]
-    }
-  }
-}
-```
+## Telegram control
 
-The daemon writes a per-mission `.mcp.json` at `/tmp/orch-<mission_id>/.mcp.json` for the worker Claude; the daemon launches each step with `claude --mcp-config <that-path>`.
+One @BotFather bot gives you:
 
-## Vocabulary
+- `/create <name>`, `/missions`, `/m <id>`, `/context` (live token sizes),
+  `/pane`, `/events`, cancel/delete - all with inline-keyboard menus.
+- **Topics mode**: point orch at a forum supergroup and every mission gets its
+  own topic. Messages you type in a topic go straight to that worker; its
+  replies come back in-thread. **Creating a topic creates a mission.**
+- Attachments both ways (images inline, any file type), typing indicators,
+  reply coalescing (rapid messages within 5 s arrive as one directive),
+  per-mission "calling name", live-location capture for `get_user_location`.
 
-- **Mission** - one Claude session in one tmux. `mission_id == claude session UUID`. Tmux session name: `mission-<id>`.
-- **Step** - a directive (prompt) sent to the worker with an entry **Cue**.
-- **Cue** types: `immediate` (first step only), `on_prev_complete`, `on_prev_complete_or_timeout` (needs `seconds`), `on_timeout` (delay since prev started, needs `seconds`).
-- **Heartbeat** - mandatory, exactly one per Mission, default 86400s, max 86400s. Cannot be deleted or silenced by the worker (worker MCP exposes `heartbeat.get` only).
-- **Status Ping** - host-defined, may be multiple. Modes: `on_step_complete` and `on_schedule` (with `seconds`).
-- **Vault** - per-Mission `pass` namespace under `mission-<id>/secrets/<name>` and `mission-<id>/cookies/<name>`.
+## Host control (drive it from another AI)
 
-## See also
+Any MCP-capable assistant can be the "host" that creates missions and reads
+the worker→host mailbox. Point it at `orch-mcp --mode host` (see
+`host-mcp-config.json`; works over SSH for remote control). Workers get their
+own scoped MCP surface automatically: `notify`, `send_file`, `talk_to_user`
+(voice extra), `message_host`, `queue.*`, `pings.*`, `heartbeat.*`,
+`get_user_location`, `mission.status`.
 
-- `examples/hello_mission.md` - a 60-second walk-through.
+## CLIs
 
-## Implementation notes / TODOs
+| command   | what |
+|-----------|------|
+| `orchd`   | the daemon (`setup`, `start`, `status`) |
+| `orchctl` | admin from the shell (create, step-add, cancel, …) |
+| `orch-mcp`| MCP server, host mode & worker mode |
+| `owatch`  | scripted-ping heartbeat/fire/ready (used by watcher scripts) |
+| `msec`    | worker-side secret/cookie reader |
 
-- Crash recovery is best-effort: if a `running` mission's tmux session is gone at daemon startup, the current step is relaunched in a new tmux with `restart_count` bumped and Telegram notified. Full DAG resumption is TODO.
-- Worker MCP surface implements `queue.*`, `pings.*`, `heartbeat.get`, `mission.status`, `secrets.list`, `cookies.list`. Wider surface can be added without daemon changes.
-- The `events` table is populated but no audit-log MCP tool is exposed yet.
+## Extras
+
+- **`extras/jami-voice/`** - J-dawg: real ringing voice calls over Jami when a
+  worker needs a decision; reads the mission's context, relays your spoken
+  answer back as a new step. See its README.
+
+## Files & dirs
+
+`~/.orch/` - db, socket, config (`orchd.env`), mailbox, incoming files,
+api-backend sessions, compact logs. Worker scratch: `/tmp/orch-<mission>/`.
+
+## Security notes
+
+Workers run with full permissions on this machine by design - they are *your*
+agents doing real work. Isolation between missions is logical (scoped tools,
+separate sessions/topics), not an OS sandbox. Don't run untrusted directives.

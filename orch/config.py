@@ -8,6 +8,33 @@ from pathlib import Path
 HOME = Path(os.path.expanduser("~"))
 
 ORCH_DIR = HOME / ".orch"
+
+
+def _load_env_file() -> None:
+    """Load KEY=VALUE lines from the first existing config file so orch works
+    the same under systemd (EnvironmentFile) and plain `orchd start`.
+    Real environment variables always win over file values."""
+    candidates = [
+        os.environ.get("ORCH_ENV_FILE"),
+        str(ORCH_DIR / "orchd.env"),
+        "/etc/orchd.env",
+    ]
+    for cand in candidates:
+        if not cand or not os.path.isfile(cand):
+            continue
+        try:
+            for line in open(cand):
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+        except OSError:
+            pass
+        break
+
+
+_load_env_file()
 DB_PATH = ORCH_DIR / "orch.db"
 SOCKET_PATH = ORCH_DIR / "orchd.sock"
 
@@ -103,6 +130,14 @@ CANCEL_GOODBYE_DIRECTIVE = (
 
 TICK_INTERVAL_S = 1.0
 MAX_RESTARTS = 5
+
+# Auto-compaction: when an idle worker's live context crosses this many tokens,
+# the engine fires a headless /compact so future wakes stay cheap. Set to 0 to
+# disable. CHECK_S throttles the (file-reading) measurement per mission;
+# COOLDOWN_S prevents re-firing while a compaction is still settling.
+AUTO_COMPACT_THRESHOLD = 200_000
+AUTO_COMPACT_CHECK_S = 60
+AUTO_COMPACT_COOLDOWN_S = 600
 
 ENV_MASTER_PASSPHRASE = "ORCH_MASTER_PASSPHRASE"
 ENV_TELEGRAM_TOKEN = "ORCH_TELEGRAM_BOT_TOKEN"
