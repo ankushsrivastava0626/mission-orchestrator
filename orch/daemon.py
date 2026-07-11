@@ -403,16 +403,24 @@ def h_agent_get(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
 
 def h_agent_set(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     """Switch the worker backend live (e.g. claude -> gemini). Persists to the
-    env file; running missions migrate on their next wake via handoff."""
-    from . import agent_switch
+    env file; running missions migrate on their next wake via handoff.
+    Optional `model` (opencode): sets the global ORCH_OPENCODE_MODEL."""
+    from . import agent_switch, agents
     (name,) = _require(p, "agent")
     try:
-        return agent_switch.set_active_agent(
+        res = agent_switch.set_active_agent(
             d.conn, str(name), by=str(p.get("by") or "rpc"),
             force=bool(p.get("force")),
         )
     except ValueError as e:
         raise RPCError("bad_agent", str(e))
+    model = str(p.get("model") or "").strip()
+    if model and agents.canonical(str(name)) == "opencode":
+        config.update_env_file("ORCH_OPENCODE_MODEL", model)
+        os.environ["ORCH_OPENCODE_MODEL"] = model
+        _oc_remember(d, model)
+        res["model"] = model
+    return res
 
 
 def _mission_adapter(m) -> "Any":
@@ -423,6 +431,23 @@ def _mission_adapter(m) -> "Any":
         return agents.adapter_named(stored)
     except Exception:  # noqa: BLE001
         return agents.get_adapter()
+
+
+OC_RECENTS_KEY = "opencode_recent_models"
+
+
+def _oc_recents(d: Daemon) -> list[str]:
+    try:
+        return json.loads(db.get_meta(d.conn, OC_RECENTS_KEY) or "[]")
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _oc_remember(d: Daemon, model: str) -> None:
+    if not model:
+        return
+    rec = [model] + [m for m in _oc_recents(d) if m != model]
+    db.set_meta(d.conn, OC_RECENTS_KEY, json.dumps(rec[:6]))
 
 
 def h_mission_set_agent(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
@@ -445,11 +470,17 @@ def h_mission_set_agent(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     if not ok and not p.get("force"):
         raise RPCError("bad_agent", f"backend '{name}' is not usable here: {reason}")
     db.set_mission_pinned_agent(d.conn, mission_id, name)
+    model = str(p.get("model") or "").strip()
+    if name == "opencode":
+        from .agents.opencode import OpenCodeAdapter
+        OpenCodeAdapter().set_model(mission_id, model or None)
+        if model:
+            _oc_remember(d, model)
     db.log_event(
         d.conn, mission_id=mission_id, kind="agent_pinned",
-        payload={"agent": name},
+        payload={"agent": name, **({"model": model} if model else {})},
     )
-    return {"ok": True, "pinned": name,
+    return {"ok": True, "pinned": name, "model": model or None,
             "note": ("this mission now runs on that backend (migrating with a "
                      "handoff on its next wake); all other missions keep the "
                      "global agent")}

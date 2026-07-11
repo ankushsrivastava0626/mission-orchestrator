@@ -66,6 +66,28 @@ class OpenCodeAdapter(Adapter):
         (wd / "opencode.json").write_text(json.dumps(
             {"$schema": "https://opencode.ai/config.json", "mcp": mcp}, indent=2))
 
+    # ---- per-mission model choice ----------------------------------------
+
+    def model_file(self, mission_id: str) -> Path:
+        return self._workdir(mission_id) / ".opencode-model"
+
+    def set_model(self, mission_id: str, model: str | None) -> None:
+        self._workdir(mission_id).mkdir(parents=True, exist_ok=True)
+        f = self.model_file(mission_id)
+        if model:
+            f.write_text(model.strip())
+        else:
+            f.unlink(missing_ok=True)
+
+    def get_model(self, mission_id: str) -> str:
+        """Mission-pinned model wins; else the global ORCH_OPENCODE_MODEL."""
+        f = self.model_file(mission_id)
+        if f.exists():
+            m = f.read_text().strip()
+            if m:
+                return m
+        return os.environ.get("ORCH_OPENCODE_MODEL", "").strip()
+
     def step_cmd(self, mission_id: str, directive: str, first: bool) -> str:
         wd = self._workdir(mission_id)
         envs = [f"ORCH_MISSION_ID={mission_id}"]
@@ -73,7 +95,11 @@ class OpenCodeAdapter(Adapter):
             val = os.environ.get(key)
             if val:
                 envs.append(f"{key}={self.q(val)}")
-        model = os.environ.get("ORCH_OPENCODE_MODEL", "").strip()
+        model = self.get_model(mission_id)
+        # OpenRouter model ids ("vendor/model[:tag]") need the provider prefix.
+        if model and "/" in model and not model.startswith(("openrouter/",)) \
+                and os.environ.get("OPENROUTER_API_KEY"):
+            model = f"openrouter/{model}"
         model_flag = f" -m {self.q(model)}" if model else ""
         cont = "" if first else " --continue"
         return (

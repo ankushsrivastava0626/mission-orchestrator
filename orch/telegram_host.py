@@ -373,6 +373,10 @@ class TelegramHost:
         text: str, msg_id: int | None,
     ) -> None:
         action, mid = pend
+        if action == "oc_model":
+            # mid holds the short id from the picker; text is the model id.
+            await self._apply_opencode(client, chat_id, mid, text.strip())
+            return
         if action == "call_name":
             val = text.strip()
             clear = val in ("-", "")
@@ -452,6 +456,10 @@ class TelegramHost:
         self, client: httpx.AsyncClient, chat_id: str, arg: str,
     ) -> None:
         sid, _, name = arg.partition(":")
+        if name == "opencode":
+            # OpenCode = any model behind one key - ask WHICH model first.
+            await self._prompt_opencode_model(client, chat_id, sid)
+            return
         try:
             mid = self._resolve_mid(sid)
             res = self._rpc("mission.set_agent", {"mission_id": mid, "agent":
@@ -474,6 +482,80 @@ class TelegramHost:
                 client, chat_id,
                 f"🌐 *{mname}* follows the global agent again.",
             )
+
+    def _oc_recents(self) -> list[str]:
+        import json as _json
+        try:
+            return _json.loads(db.get_meta(self.daemon.conn, "opencode_recent_models") or "[]")
+        except Exception:  # noqa: BLE001
+            return []
+
+    async def _prompt_opencode_model(
+        self, client: httpx.AsyncClient, chat_id: str, sid: str,
+    ) -> None:
+        """Model picker for OpenCode: recently used as buttons + free typing."""
+        recents = self._oc_recents()
+        rows: list[list[dict]] = []
+        for i, m in enumerate(recents[:6]):
+            label = m if len(m) <= 48 else m[:45] + "…"
+            rows.append([_btn(f"🕘 {label}", f"ocm:{sid}:{i}")])
+        rows.append([_btn("✏️ type a model name", f"ocmt:{sid}")])
+        rows.append([_btn("▶ use default/global model", f"ocm:{sid}:-")])
+        rows.append([_btn("← back", f"magent:{sid}")])
+        await self._send(
+            client, chat_id,
+            "🧩 *OpenCode* - pick the model for this mission.\n"
+            "Any OpenRouter id works (e.g. `tencent/hy3:free`, "
+            "`deepseek/deepseek-chat`, `anthropic/claude-sonnet-4.5`).",
+            markup=_ikb(rows),
+        )
+
+    async def _pick_opencode_model(
+        self, client: httpx.AsyncClient, chat_id: str, arg: str,
+    ) -> None:
+        sid, _, idx = arg.partition(":")
+        model = ""
+        if idx != "-":
+            recents = self._oc_recents()
+            try:
+                model = recents[int(idx)]
+            except (ValueError, IndexError):
+                await self._send(client, chat_id, "❌ that entry expired - pick again.")
+                return
+        await self._apply_opencode(client, chat_id, sid, model)
+
+    async def _prompt_opencode_custom(
+        self, client: httpx.AsyncClient, chat_id: str, sid: str,
+    ) -> None:
+        prompt_id = await self._send(
+            client, chat_id,
+            "✏️ Reply with the model id to use (OpenRouter format), e.g. "
+            "`tencent/hy3:free` or `qwen/qwen3-coder:free`.",
+            force_reply=True,
+        )
+        if prompt_id is not None:
+            self._pending_input[prompt_id] = ("oc_model", sid)
+
+    async def _apply_opencode(
+        self, client: httpx.AsyncClient, chat_id: str, sid: str, model: str,
+    ) -> None:
+        try:
+            mid = self._resolve_mid(sid)
+            res = self._rpc("mission.set_agent",
+                            {"mission_id": mid, "agent": "opencode",
+                             "model": model})
+        except Exception as e:  # noqa: BLE001
+            await self._send(client, chat_id, f"❌ {e}")
+            return
+        row = self.daemon.conn.execute(
+            "SELECT name FROM missions WHERE id=?", (mid,)).fetchone()
+        mname = row["name"] if row else sid
+        mtxt = f" running *{res['model']}*" if res.get("model") else " (default model)"
+        await self._send(
+            client, chat_id,
+            f"🧩 *{mname}* pinned to *opencode*{mtxt} - migrates on its next "
+            f"wake with handoff notes. Other missions keep the global agent.",
+        )
 
     async def _prompt_call_name(
         self, client: httpx.AsyncClient, chat_id: str, sid: str,
@@ -633,6 +715,10 @@ class TelegramHost:
             await self._prompt_mission_agent(client, chat_id, arg)
         elif action == "magentset":
             await self._set_mission_agent(client, chat_id, arg)
+        elif action == "ocm":
+            await self._pick_opencode_model(client, chat_id, arg)
+        elif action == "ocmt":
+            await self._prompt_opencode_custom(client, chat_id, arg)
         else:
             await self._send(client, chat_id, f"❌ unknown action `{action}`")
 
@@ -1016,10 +1102,12 @@ def _cmd_agent(self: TelegramHost, args: list[str]) -> str:
     """Show or switch the worker agent backend: /agent [claude|codex|gemini|api|custom]"""
     if args:
         try:
-            res = self._rpc("agent.set", {"agent": args[0], "by": "telegram"})
+            res = self._rpc("agent.set", {"agent": args[0], "by": "telegram",
+                                          "model": args[1] if len(args) > 1 else ""})
         except Exception as e:  # noqa: BLE001
             return f"❌ {e}"
-        return (f"🤖 agent switched *{res['from']}* → *{res['to']}*.\n"
+        mtxt = f" (model *{res['model']}*)" if res.get("model") else ""
+        return (f"🤖 agent switched *{res['from']}* → *{res['to']}*{mtxt}.\n"
                 f"Running missions migrate on their next wake (fresh session + "
                 f"handoff notes). If *{res['to']}* turns out broken, orch falls "
                 f"back to the last agent that worked.")
