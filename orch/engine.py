@@ -170,8 +170,10 @@ class Engine:
         """Runs before every worker launch. Four jobs:
         1. Resolve which backend this mission runs on: its pinned_agent if set
            (per-mission override), else the global adapter.
-        2. If that backend is unusable: a pinned one gets unpinned back to
-           global; a dead global falls back to the last agent that worked.
+        2. If that backend is unusable: with agent_auto_fallback ON, a pinned
+           one gets unpinned and a dead global falls back to the last agent
+           that worked; with it OFF (default) the launch fails loudly and the
+           user's choice stays put.
         3. If the mission's session lives on a DIFFERENT backend, migrate it:
            fresh session seeded with a handoff summary of the old one.
         4. Trust the adapter's has_session() over DB history for create-vs-
@@ -185,7 +187,13 @@ class Engine:
             adapter = agents.adapter_named(pinned)
             ok, reason = adapter.available()
             if not ok:
-                # Pinned backend died - unpin so the mission keeps running on
+                if not config.agent_auto_fallback():
+                    # Sticky mode (default): the user's choice is permanent -
+                    # fail loudly rather than switch behind their back.
+                    raise runner.RunnerError(
+                        f"pinned agent '{pinned}' unavailable ({reason}); "
+                        f"staying pinned (agent_auto_fallback=off)")
+                # Fallback enabled: unpin so the mission keeps running on
                 # the global agent instead of stalling.
                 db.set_mission_pinned_agent(self.conn, mission_id, None)
                 db.log_event(
@@ -200,7 +208,8 @@ class Engine:
         ok, reason = adapter.available()
         if not ok:
             last_good = db.get_meta(self.conn, agent_switch.META_LAST_GOOD)
-            if (last_good and agents.canonical(last_good) != adapter.name
+            if (config.agent_auto_fallback()
+                    and last_good and agents.canonical(last_good) != adapter.name
                     and agents.availability(last_good)[0]):
                 agent_switch.set_active_agent(
                     self.conn, last_good, by="launch-fallback")
@@ -212,8 +221,8 @@ class Engine:
                 adapter = agents.get_adapter()
             else:
                 raise runner.RunnerError(
-                    f"agent '{adapter.name}' unavailable ({reason}) and no "
-                    f"working fallback recorded")
+                    f"agent '{adapter.name}' unavailable ({reason}); not "
+                    f"switching automatically (agent_auto_fallback=off)")
         stored = ((m["agent"] if "agent" in m.keys() else None) or "claude")
         rebuild_key = f"rebuild:{mission_id}"
         if agents.canonical(stored) != adapter.name:

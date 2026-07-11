@@ -29,7 +29,9 @@ class CodexAdapter(Adapter):
         return False, f"`{CODEX_BIN}` not found on PATH"
 
     def _home(self, mission_id: str) -> Path:
-        return config.worker_tmpdir(mission_id) / "codex-home"
+        # Durable (NOT /tmp): sessions must survive reboots and mission
+        # teardown/reopen, so the user's backend choice stays seamless.
+        return Path(os.path.expanduser("~/.orch/codex-work")) / mission_id / "codex-home"
 
     def prepare(self, mission_id: str) -> None:
         home = self._home(mission_id)

@@ -200,6 +200,14 @@ AUTO_COMPACT_COOLDOWN_S = _env_int("ORCH_AUTO_COMPACT_COOLDOWN_S", 600)
 AGENT_FAIL_LIMIT = _env_int("ORCH_AGENT_FAIL_LIMIT", 2)
 AGENT_FAST_FAIL_S = _env_int("ORCH_AGENT_FAST_FAIL_S", 45)
 
+
+def agent_auto_fallback() -> bool:
+    """Whether orch may EVER change the agent on its own (revert to last-good,
+    auto-unpin a dead pinned backend). Default OFF: whatever the user set
+    stays set, forever - failures are logged, never silently rerouted."""
+    return (os.environ.get("ORCH_AGENT_AUTO_FALLBACK", "off").strip().lower()
+            in ("1", "true", "on", "yes"))
+
 # Cross-agent handoff document sizing.
 HANDOFF_TAIL_CHARS = _env_int("ORCH_HANDOFF_TAIL_CHARS", 6000)
 HANDOFF_CAP_CHARS = _env_int("ORCH_HANDOFF_CAP_CHARS", 9000)
@@ -282,6 +290,9 @@ SETTINGS: dict[str, tuple[str, str, str, str | None, str]] = {
                      "crash-recovery attempts before a mission is failed"),
     "tick_interval_s": ("ORCH_TICK_INTERVAL_S", "float", "1.0",
                         "TICK_INTERVAL_S", "engine scheduler tick"),
+    "agent_auto_fallback": ("ORCH_AGENT_AUTO_FALLBACK", "str", "off", None,
+                            "on = orch may auto-revert/unpin a dead backend; "
+                            "off = your choice is permanent (failures just log)"),
     "agent_fail_limit": ("ORCH_AGENT_FAIL_LIMIT", "int", "2",
                          "AGENT_FAIL_LIMIT",
                          "consecutive dead turns before fallback/unpin"),

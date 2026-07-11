@@ -24,9 +24,11 @@ running mission *migrates on its next wake*: it starts a fresh session on the
 new agent seeded with an auto-generated handoff (mission state, step history,
 active watchers, and a tail of the old conversation) - no work lost, no tokens
 spent building it. `orchctl agent show` lists what's usable on the machine.
-**Fallback:** orch tracks the last backend that demonstrably worked; if the
-active one is missing/broken (or produces dead turns twice in a row), it
-auto-reverts and keeps the fleet running.
+**Sticky by default:** whatever agent/model you set STAYS set - orch never
+switches behind your back; a broken backend fails loudly in the logs instead.
+Optional safety net: `orchctl config set agent_auto_fallback on` lets orch
+auto-revert to the last working backend (and unpin dead pinned ones) after
+repeated dead turns.
 
 **Per-mission override** - pin a single mission to a different backend while
 everything else stays on the global one: the 🤖 button on the mission's

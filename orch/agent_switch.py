@@ -84,9 +84,9 @@ def record_turn_result(conn: sqlite3.Connection, mission_id: str,
             return
         fails = int(db.get_meta(conn, key, "0") or 0) + 1
         db.set_meta(conn, key, str(fails))
-        log.warning("pinned agent '%s': fast quiet turn on %s (%d/%d before unpin)",
-                    agent_name, mission_id, fails, config.AGENT_FAIL_LIMIT)
-        if fails >= config.AGENT_FAIL_LIMIT:
+        log.warning("pinned agent '%s': fast quiet turn on %s (%d consecutive)",
+                    agent_name, mission_id, fails)
+        if config.agent_auto_fallback() and fails >= config.AGENT_FAIL_LIMIT:
             db.set_mission_pinned_agent(conn, mission_id, None)
             db.set_meta(conn, key, "0")
             db.log_event(conn, mission_id=mission_id, kind="agent_pin_dropped",
@@ -103,9 +103,9 @@ def record_turn_result(conn: sqlite3.Connection, mission_id: str,
         return  # long quiet turn - could be legitimate silent work; neutral
     fails = int(db.get_meta(conn, META_FAILS, "0") or 0) + 1
     db.set_meta(conn, META_FAILS, str(fails))
-    log.warning("agent '%s': fast quiet turn on %s (%d/%d before fallback)",
-                agent_name, mission_id, fails, config.AGENT_FAIL_LIMIT)
-    if fails < config.AGENT_FAIL_LIMIT:
+    log.warning("agent '%s': fast quiet turn on %s (%d consecutive)",
+                agent_name, mission_id, fails)
+    if not config.agent_auto_fallback() or fails < config.AGENT_FAIL_LIMIT:
         return
     last_good = db.get_meta(conn, META_LAST_GOOD)
     if not last_good or agents.canonical(last_good) == agent_name:
