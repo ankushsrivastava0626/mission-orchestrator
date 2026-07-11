@@ -11,7 +11,9 @@ Works with **any coding agent**:
 | backend  | runs on                              | resume | compact | notes |
 |----------|--------------------------------------|--------|---------|-------|
 | `claude` | Claude Code CLI                      | ✓      | ✓       | richest support (default) |
-| `codex`  | OpenAI Codex CLI                     | ✓      | -       | per-mission CODEX_HOME isolation |
+| `codex`  | OpenAI Codex CLI                     | ✓      | ✓       | per-mission CODEX_HOME isolation |
+| `antigravity` | Google Antigravity (`agy`)      | ✓      | -       | tools via the `oworker` shell bridge |
+| `opencode` | OpenCode (open source)             | ✓      | -       | any model via `-m provider/model` (OpenRouter, local, …) |
 | `gemini` | Gemini CLI                           | ✓      | -       | per-mission workdir isolation |
 | `api`    | **no CLI - just an API key**         | ✓      | ✓       | Anthropic or any OpenAI-compatible endpoint (OpenAI, OpenRouter, Ollama, …) |
 | `custom` | any agent CLI via command templates  | you    | -       | plug in anything |
@@ -94,6 +96,7 @@ own scoped MCP surface automatically: `notify`, `send_file`, `talk_to_user`
 | `orch-mcp`| MCP server, host mode & worker mode |
 | `owatch`  | scripted-ping heartbeat/fire/ready (used by watcher scripts) |
 | `msec`    | worker-side secret/cookie reader |
+| `oworker` | worker toolkit as shell commands (for MCP-less backends) |
 
 ## Extras
 

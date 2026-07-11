@@ -20,6 +20,7 @@ CODEX_BIN = os.environ.get("ORCH_CODEX_BIN", "codex")
 
 class CodexAdapter(Adapter):
     name = "codex"
+    supports_compact = True
 
     def available(self) -> tuple[bool, str]:
         import shutil as _sh
@@ -82,7 +83,62 @@ class CodexAdapter(Adapter):
         return "codex" in line and mission_id in line
 
     def has_session(self, mission_id: str) -> bool | None:
+        return self._latest_rollout(mission_id) is not None
+
+    # ---- session size + compaction --------------------------------------
+
+    def _latest_rollout(self, mission_id: str) -> str | None:
         import glob
         home = self._home(mission_id)
-        return bool(glob.glob(str(home / "sessions" / "**" / "*.jsonl"),
-                              recursive=True))
+        hits = glob.glob(str(home / "sessions" / "**" / "*.jsonl"), recursive=True)
+        return max(hits, key=os.path.getmtime) if hits else None
+
+    def session_path(self, mission_id: str) -> str | None:
+        return self._latest_rollout(mission_id)
+
+    def context_tokens(self, mission_id: str) -> tuple[int, int] | None:
+        """Codex rollouts log token_count events; last_token_usage.input_tokens
+        is what the most recent turn re-read - i.e. the live context size."""
+        path = self._latest_rollout(mission_id)
+        if not path:
+            return None
+        last = 0
+        turns = 0
+        try:
+            for line in open(path):
+                if '"token_count"' not in line and '"user_message"' not in line:
+                    continue
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                payload = o.get("payload") or o
+                if payload.get("type") == "user_message":
+                    turns += 1
+                    continue
+                if payload.get("type") == "token_count":
+                    info = payload.get("info") or {}
+                    ltu = info.get("last_token_usage") or {}
+                    v = int(ltu.get("input_tokens") or 0)
+                    if v > 0:
+                        last = v
+        except OSError:
+            return None
+        return (last, turns) if last else None
+
+    def compact(self, mission_id: str) -> bool:
+        """Headless `/compact` - verified: `codex exec resume --last "/compact"`
+        summarizes the session in place ("Context compacted.")."""
+        import subprocess
+        home = self._home(mission_id)
+        logf = open(os.path.expanduser(f"~/.orch/compact-{mission_id}.log"), "ab")
+        logf.write(f"\n=== codex compact start mid={mission_id} ===\n".encode())
+        logf.flush()
+        subprocess.Popen(
+            [CODEX_BIN, "exec", "resume", "--last", "--yolo",
+             "--skip-git-repo-check", "/compact"],
+            stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
+            start_new_session=True, cwd="/",
+            env={**os.environ, "CODEX_HOME": str(home)},
+        )
+        return True
