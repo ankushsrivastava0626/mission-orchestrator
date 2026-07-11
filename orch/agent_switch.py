@@ -71,9 +71,34 @@ def record_turn_result(conn: sqlite3.Connection, mission_id: str,
     since launch; updates last-good / consecutive-failure state and triggers
     the automatic fallback when the active backend looks dead."""
     active = agents.get_adapter().name
-    if agent_name != active:
-        return  # a straggler turn from before a switch - ignore
     produced = _worker_activity_since(conn, mission_id, started_ts)
+    if agent_name != active:
+        # A pinned-backend turn (or a straggler from before a switch). Grade
+        # it against the PIN: two dead turns on a pinned backend auto-unpin
+        # the mission back to the global agent instead of letting it stall.
+        m = db.get_mission(conn, mission_id)
+        pinned = (m["pinned_agent"] if m and "pinned_agent" in m.keys() else None)
+        if not pinned or agents.canonical(pinned) != agent_name:
+            return
+        key = f"{META_FAILS}:{mission_id}"
+        if produced:
+            db.set_meta(conn, key, "0")
+            return
+        if ended_ts - started_ts >= FAST_FAIL_S:
+            return
+        fails = int(db.get_meta(conn, key, "0") or 0) + 1
+        db.set_meta(conn, key, str(fails))
+        log.warning("pinned agent '%s': fast quiet turn on %s (%d/%d before unpin)",
+                    agent_name, mission_id, fails, FAIL_LIMIT)
+        if fails >= FAIL_LIMIT:
+            db.set_mission_pinned_agent(conn, mission_id, None)
+            db.set_meta(conn, key, "0")
+            db.log_event(conn, mission_id=mission_id, kind="agent_pin_dropped",
+                         payload={"pinned": agent_name,
+                                  "reason": f"{fails} consecutive dead turns"})
+            log.error("mission %s: pinned agent '%s' looks dead - unpinned back "
+                      "to global '%s'", mission_id, agent_name, active)
+        return
     if produced:
         db.set_meta(conn, META_LAST_GOOD, agent_name)
         db.set_meta(conn, META_FAILS, "0")

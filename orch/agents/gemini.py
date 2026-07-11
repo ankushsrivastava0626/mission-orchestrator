@@ -54,8 +54,17 @@ class GeminiAdapter(Adapter):
     def step_cmd(self, mission_id: str, directive: str, first: bool) -> str:
         wd = self._workdir(mission_id)
         resume = "" if first else f" {RESUME_ARGS}"
+        # Trust the per-mission workdir (gemini refuses headless runs in
+        # untrusted folders) and forward API-key auth from the daemon env -
+        # the tmux pane doesn't inherit it (Google retired the CLI's free
+        # login tier, so an API key is the reliable headless auth).
+        envs = [f"ORCH_MISSION_ID={mission_id}", "GEMINI_CLI_TRUST_WORKSPACE=true"]
+        for key in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "GOOGLE_CLOUD_PROJECT"):
+            val = os.environ.get(key)
+            if val:
+                envs.append(f"{key}={self.q(val)}")
         return (
-            f"cd {self.q(str(wd))} && env ORCH_MISSION_ID={mission_id}"
+            f"cd {self.q(str(wd))} && env {' '.join(envs)}"
             f" {GEMINI_BIN} --yolo{resume} -p {self.q(directive)}"
         )
 
