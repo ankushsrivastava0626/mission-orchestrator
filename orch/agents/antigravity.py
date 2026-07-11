@@ -67,5 +67,9 @@ class AntigravityAdapter(Adapter):
         return "agy" in line and mission_id in line
 
     def has_session(self, mission_id: str) -> bool | None:
-        hist = Path(os.path.expanduser("~/.gemini/history")) / f"agy-{mission_id}"
-        return hist.exists()
+        # agy stores conversations in ~/.gemini/antigravity-cli/conversations
+        # as opaque per-id SQLite DBs with no exposed cwd mapping - we can't
+        # cheaply tell which belongs to this mission. Return None so the
+        # engine falls back to DB history (first launch = create, then
+        # --continue), which is correct for agy's per-workdir continuity.
+        return None
