@@ -28,6 +28,12 @@ class ClaudeCodeAdapter(Adapter):
     name = "claude"
     supports_compact = True
 
+    def available(self) -> tuple[bool, str]:
+        import shutil as _sh
+        if _sh.which(CLAUDE_BIN) or os.path.isfile(os.path.expanduser("~/.local/bin/claude")):
+            return True, "ok"
+        return False, f"`{CLAUDE_BIN}` not found on PATH"
+
     def prepare(self, mission_id: str) -> None:
         from .. import runner
         runner.write_worker_mcp_config(mission_id)
@@ -56,6 +62,9 @@ class ClaudeCodeAdapter(Adapter):
 
     def session_path(self, mission_id: str) -> str | None:
         return self.session_jsonl(mission_id)
+
+    def has_session(self, mission_id: str) -> bool | None:
+        return self.session_jsonl(mission_id) is not None
 
     def context_tokens(self, mission_id: str) -> tuple[int, int] | None:
         path = self.session_jsonl(mission_id)

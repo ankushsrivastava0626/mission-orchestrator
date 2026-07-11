@@ -188,10 +188,11 @@ def cleanup_worker_tmp(mission_id: str) -> None:
 
 
 def launch_step(
-    mission_id: str, directive: str, *, first_step: bool
+    mission_id: str, directive: str, *, first_step: bool, adapter=None
 ) -> None:
     from . import agents
-    adapter = agents.get_adapter()
+    if adapter is None:
+        adapter = agents.get_adapter()
     session = config.tmux_session_name(mission_id)
     if not tmux_session_exists(session):
         tmux_create_session(mission_id)
@@ -215,7 +216,6 @@ def step_running(mission_id: str) -> bool:
     process that merely *mentions* the id (e.g. a grep) doesn't false-match.
     """
     from . import agents
-    adapter = agents.get_adapter()
     try:
         res = subprocess.run(
             ["pgrep", "-af", mission_id],
@@ -227,7 +227,9 @@ def step_running(mission_id: str) -> bool:
         # Ignore our own pgrep and shell wrappers quoting the id.
         if "pgrep" in line:
             continue
-        if adapter.is_running_line(line, mission_id):
+        # Missions can be pinned to a non-global backend, so match against
+        # every backend's process signature, not just the active adapter's.
+        if agents.any_worker_line(line, mission_id):
             return True
     return False
 

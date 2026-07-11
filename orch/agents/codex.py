@@ -21,6 +21,12 @@ CODEX_BIN = os.environ.get("ORCH_CODEX_BIN", "codex")
 class CodexAdapter(Adapter):
     name = "codex"
 
+    def available(self) -> tuple[bool, str]:
+        import shutil as _sh
+        if _sh.which(CODEX_BIN):
+            return True, "ok"
+        return False, f"`{CODEX_BIN}` not found on PATH"
+
     def _home(self, mission_id: str) -> Path:
         return config.worker_tmpdir(mission_id) / "codex-home"
 
@@ -73,3 +79,9 @@ class CodexAdapter(Adapter):
 
     def is_running_line(self, line: str, mission_id: str) -> bool:
         return "codex" in line and mission_id in line
+
+    def has_session(self, mission_id: str) -> bool | None:
+        import glob
+        home = self._home(mission_id)
+        return bool(glob.glob(str(home / "sessions" / "**" / "*.jsonl"),
+                              recursive=True))

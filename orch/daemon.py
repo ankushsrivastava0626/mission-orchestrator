@@ -272,6 +272,7 @@ def h_mission_create(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
         telegram_chat_id=str(chat_id),
         heartbeat_interval_s=interval,
     )
+    db.set_mission_agent(d.conn, mission_id, agents.get_adapter().name)
     db.log_event(d.conn, mission_id=mission_id, kind="mission_created")
     # Topics: either bind to a pre-existing topic the user just created in the
     # app (tg_topic_id given), or auto-create one for this mission.
@@ -342,13 +343,72 @@ def h_mission_set_call_name(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "call_name": name}
 
 
-def h_mission_context_info(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
-    """Live context size of a mission's worker session - what each wake re-ingests.
-    Delegated to the active agent adapter; not every backend can measure it."""
+def h_agent_get(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Active agent backend, last-known-good, and per-backend availability."""
+    from . import agent_switch
+    return agent_switch.status(d.conn)
+
+
+def h_agent_set(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Switch the worker backend live (e.g. claude -> gemini). Persists to the
+    env file; running missions migrate on their next wake via handoff."""
+    from . import agent_switch
+    (name,) = _require(p, "agent")
+    try:
+        return agent_switch.set_active_agent(
+            d.conn, str(name), by=str(p.get("by") or "rpc"),
+            force=bool(p.get("force")),
+        )
+    except ValueError as e:
+        raise RPCError("bad_agent", str(e))
+
+
+def _mission_adapter(m) -> "Any":
+    """Adapter for the backend a mission's session actually lives on."""
+    from . import agents
+    stored = (m["agent"] if "agent" in m.keys() else None) or "claude"
+    try:
+        return agents.adapter_named(stored)
+    except Exception:  # noqa: BLE001
+        return agents.get_adapter()
+
+
+def h_mission_set_agent(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Pin ONE mission to a specific backend (overrides the global agent for
+    that mission only). agent=null/''/'global' clears the pin. The mission
+    migrates on its next wake via handoff."""
     from . import agents
     (mission_id,) = _require(p, "mission_id")
-    _mission_or_raise(d.conn, mission_id)
-    adapter = agents.get_adapter()
+    m = _mission_or_raise(d.conn, mission_id)
+    raw = p.get("agent")
+    name = agents.canonical(str(raw)) if raw else ""
+    if not name or name in ("global", "-"):
+        db.set_mission_pinned_agent(d.conn, mission_id, None)
+        db.log_event(d.conn, mission_id=mission_id, kind="agent_pin_cleared")
+        return {"ok": True, "pinned": None,
+                "note": "mission follows the global agent again"}
+    if name not in agents.AGENT_NAMES:
+        raise RPCError("bad_agent", f"unknown backend {name!r}")
+    ok, reason = agents.availability(name)
+    if not ok and not p.get("force"):
+        raise RPCError("bad_agent", f"backend '{name}' is not usable here: {reason}")
+    db.set_mission_pinned_agent(d.conn, mission_id, name)
+    db.log_event(
+        d.conn, mission_id=mission_id, kind="agent_pinned",
+        payload={"agent": name},
+    )
+    return {"ok": True, "pinned": name,
+            "note": ("this mission now runs on that backend (migrating with a "
+                     "handoff on its next wake); all other missions keep the "
+                     "global agent")}
+
+
+def h_mission_context_info(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Live context size of a mission's worker session - what each wake re-ingests.
+    Delegated to the backend the session lives on; not every one can measure it."""
+    (mission_id,) = _require(p, "mission_id")
+    m = _mission_or_raise(d.conn, mission_id)
+    adapter = _mission_adapter(m)
     ct = adapter.context_tokens(mission_id)
     if ct is None:
         return {"available": False, "agent": adapter.name}
@@ -369,10 +429,9 @@ def h_mission_compact(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     """Compact a mission's worker session so future wakes re-ingest a small
     summary instead of the whole transcript. Runs detached; returns immediately
     with the pre-compaction size. Unsupported on some agent backends."""
-    from . import agents
     (mission_id,) = _require(p, "mission_id")
-    _mission_or_raise(d.conn, mission_id)
-    adapter = agents.get_adapter()
+    m = _mission_or_raise(d.conn, mission_id)
+    adapter = _mission_adapter(m)
     if not adapter.supports_compact:
         raise RPCError("unsupported",
                        f"the {adapter.name} backend doesn't support compaction")
@@ -1189,6 +1248,9 @@ _HANDLERS: dict[str, Handler] = {
     "defaults.get": h_defaults_get,
     "notify": h_notify,
     "notify_file": h_notify_file,
+    "agent.get": h_agent_get,
+    "agent.set": h_agent_set,
+    "mission.set_agent": h_mission_set_agent,
     "mission.hold": h_mission_hold,
     "host.message": h_host_message,
     "host.inbox": h_host_inbox,

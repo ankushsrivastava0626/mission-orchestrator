@@ -223,6 +223,32 @@ Terminal mission states are required before mission.delete will succeed.
 
 HOST_TOOLS: list[Tool] = [
     Tool(
+        name="agent.get",
+        description=(
+            "Which AI backend runs the workers (claude / codex / gemini / api / "
+            "custom), the last backend known to work, and each backend's "
+            "availability on this machine.\n\nArgs: {}."
+        ),
+        inputSchema=_obj({}, []),
+    ),
+    Tool(
+        name="agent.set",
+        description=(
+            "Switch the worker AI backend live (e.g. claude -> gemini). "
+            "Persists across restarts; each running mission migrates on its "
+            "next wake - fresh session on the new agent seeded with a handoff "
+            "summary of its old one. If the new backend turns out broken, orch "
+            "auto-falls back to the last one that worked.\n\n"
+            "Args: {agent (required), force? (skip availability check)}."
+        ),
+        inputSchema=_obj(
+            {"agent": {"type": "string",
+                       "enum": ["claude", "codex", "gemini", "api", "custom"]},
+             "force": {"type": "boolean"}},
+            ["agent"],
+        ),
+    ),
+    Tool(
         name="host.inbox",
         description=(
             "Read messages workers have sent up to you (the host) via their message_host tool. "

@@ -35,6 +35,40 @@ def _load_env_file() -> None:
 
 
 _load_env_file()
+
+
+def active_env_file() -> str:
+    """The env file live config changes should be written to."""
+    for cand in (os.environ.get("ORCH_ENV_FILE"),
+                 str(ORCH_DIR / "orchd.env"), "/etc/orchd.env"):
+        if cand and os.path.isfile(cand):
+            return cand
+    return str(ORCH_DIR / "orchd.env")
+
+
+def update_env_file(key: str, value: str) -> str:
+    """Set KEY=value in the active env file (replace or append). Returns the
+    file path. Keeps changes durable across daemon restarts."""
+    path = active_env_file()
+    lines: list[str] = []
+    if os.path.isfile(path):
+        lines = open(path).read().splitlines()
+    hit = False
+    for i, line in enumerate(lines):
+        if line.split("=", 1)[0].strip().lstrip("#").strip() == key and "=" in line:
+            lines[i] = f"{key}={value}"
+            hit = True
+            break
+    if not hit:
+        lines.append(f"{key}={value}")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as fh:
+        fh.write("\n".join(lines) + "\n")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return path
 DB_PATH = ORCH_DIR / "orch.db"
 SOCKET_PATH = ORCH_DIR / "orchd.sock"
 

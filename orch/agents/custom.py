@@ -32,6 +32,9 @@ class CustomAdapter(Adapter):
                 "(and optionally ORCH_CUSTOM_RESUME_CMD)"
             )
 
+    def available(self) -> tuple[bool, str]:
+        return (True, "ok") if self.first_tmpl else (False, "ORCH_CUSTOM_FIRST_CMD not set")
+
     def step_cmd(self, mission_id: str, directive: str, first: bool) -> str:
         tmpl = self.first_tmpl if first else self.resume_tmpl
         return tmpl.replace("{mission_id}", mission_id).replace(

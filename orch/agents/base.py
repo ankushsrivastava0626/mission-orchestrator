@@ -24,6 +24,11 @@ class Adapter:
 
     # ---- lifecycle -------------------------------------------------------
 
+    def available(self) -> tuple[bool, str]:
+        """Can this backend actually run on this machine right now?
+        Returns (ok, reason). Used for switch validation and fallback."""
+        return True, "ok"
+
     def prepare(self, mission_id: str) -> None:
         """Create per-mission config (MCP files, session homes). Idempotent."""
 
@@ -47,6 +52,13 @@ class Adapter:
 
     def session_path(self, mission_id: str) -> str | None:
         """Path of the persisted session/transcript file, if any."""
+        return None
+
+    def has_session(self, mission_id: str) -> bool | None:
+        """Does a resumable session actually exist for this mission right now?
+        True/False when the backend can tell; None when unknown. The engine
+        uses this over DB history to pick create-vs-resume (sessions can
+        vanish on reboot or appear again after switching agents back)."""
         return None
 
     def compact(self, mission_id: str) -> bool:

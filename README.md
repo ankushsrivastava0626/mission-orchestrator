@@ -16,6 +16,23 @@ Works with **any coding agent**:
 | `api`    | **no CLI - just an API key**         | ✓      | ✓       | Anthropic or any OpenAI-compatible endpoint (OpenAI, OpenRouter, Ollama, …) |
 | `custom` | any agent CLI via command templates  | you    | -       | plug in anything |
 
+**Switch backends live** - `orchctl agent set gemini` (or `/agent gemini` in
+Telegram, or the `agent.set` host-MCP tool). The switch persists, and each
+running mission *migrates on its next wake*: it starts a fresh session on the
+new agent seeded with an auto-generated handoff (mission state, step history,
+active watchers, and a tail of the old conversation) - no work lost, no tokens
+spent building it. `orchctl agent show` lists what's usable on the machine.
+**Fallback:** orch tracks the last backend that demonstrably worked; if the
+active one is missing/broken (or produces dead turns twice in a row), it
+auto-reverts and keeps the fleet running.
+
+**Per-mission override** - pin a single mission to a different backend while
+everything else stays on the global one: the 🤖 button on the mission's
+Telegram card, or `orchctl agent pin <mission> <backend>` (`-` clears the
+pin), or the `mission.set_agent` RPC. Pinned missions migrate with the same
+handoff mechanism; if a pinned backend dies, the mission auto-unpins back to
+the global agent rather than stalling.
+
 ## Install
 
 ```bash

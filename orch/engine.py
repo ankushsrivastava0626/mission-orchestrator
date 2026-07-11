@@ -27,6 +27,9 @@ class Engine:
         # Per-mission timestamp of the last (throttled) context-size check for
         # auto-compaction.
         self._last_ctx_check: dict[str, int] = {}
+        # In-flight worker turns: mission_id -> (launch_ts, agent_name). Used
+        # to grade each turn (worked / dead) for last-good fallback.
+        self._turn_started: dict[str, tuple[int, str]] = {}
 
     def stop(self) -> None:
         self._stop.set()
@@ -79,6 +82,21 @@ class Engine:
         # the foreground process in tmux - i.e. an OOB is in flight. We must NOT
         # fire another OOB or send keys into the pane in this state.
         claude_busy = running is None and runner.step_running(mission_id)
+
+        # Grade a finished turn (step or OOB) for agent-health tracking. A 5s
+        # grace covers the gap between tmux_send and the process appearing.
+        inflight = self._turn_started.get(mission_id)
+        if (inflight is not None and running is None and not claude_busy
+                and now - inflight[0] >= 5):
+            self._turn_started.pop(mission_id, None)
+            try:
+                from . import agent_switch
+                agent_switch.record_turn_result(
+                    self.conn, mission_id, inflight[1],
+                    started_ts=inflight[0], ended_ts=now,
+                )
+            except Exception:
+                log.exception("turn grading failed for %s", mission_id)
 
         # 2. If any OOB queued and claude is idle, fire one now.
         if running is None and not claude_busy and self._pending_oob.get(mission_id):
@@ -146,10 +164,83 @@ class Engine:
     def _enqueue_oob(self, mission_id: str, payload: dict[str, Any]) -> None:
         self._pending_oob.setdefault(mission_id, []).append(payload)
 
+    def _pre_launch(
+        self, mission_id: str, directive: str, first: bool
+    ) -> tuple[str, bool, Any]:
+        """Runs before every worker launch. Four jobs:
+        1. Resolve which backend this mission runs on: its pinned_agent if set
+           (per-mission override), else the global adapter.
+        2. If that backend is unusable: a pinned one gets unpinned back to
+           global; a dead global falls back to the last agent that worked.
+        3. If the mission's session lives on a DIFFERENT backend, migrate it:
+           fresh session seeded with a handoff summary of the old one.
+        4. Trust the adapter's has_session() over DB history for create-vs-
+           resume (sessions vanish on reboot, or reappear when switching back).
+        Returns (directive, first, adapter).
+        """
+        from . import agent_switch, agents, handoff
+        m = db.get_mission(self.conn, mission_id)
+        pinned = (m["pinned_agent"] if "pinned_agent" in m.keys() else None)
+        if pinned:
+            adapter = agents.adapter_named(pinned)
+            ok, reason = adapter.available()
+            if not ok:
+                # Pinned backend died - unpin so the mission keeps running on
+                # the global agent instead of stalling.
+                db.set_mission_pinned_agent(self.conn, mission_id, None)
+                db.log_event(
+                    self.conn, mission_id=mission_id, kind="agent_pin_dropped",
+                    payload={"pinned": pinned, "reason": reason},
+                )
+                log.warning("mission %s: pinned agent '%s' unavailable (%s); "
+                            "reverting to global", mission_id, pinned, reason)
+                adapter = agents.get_adapter()
+        else:
+            adapter = agents.get_adapter()
+        ok, reason = adapter.available()
+        if not ok:
+            last_good = db.get_meta(self.conn, agent_switch.META_LAST_GOOD)
+            if (last_good and agents.canonical(last_good) != adapter.name
+                    and agents.availability(last_good)[0]):
+                agent_switch.set_active_agent(
+                    self.conn, last_good, by="launch-fallback")
+                db.log_event(
+                    self.conn, mission_id=mission_id, kind="agent_fallback",
+                    payload={"from": adapter.name, "to": last_good,
+                             "reason": reason},
+                )
+                adapter = agents.get_adapter()
+            else:
+                raise runner.RunnerError(
+                    f"agent '{adapter.name}' unavailable ({reason}) and no "
+                    f"working fallback recorded")
+        stored = ((m["agent"] if "agent" in m.keys() else None) or "claude")
+        if agents.canonical(stored) != adapter.name:
+            doc = handoff.build_handoff(self.conn, mission_id, stored, adapter.name)
+            directive = handoff.wrap_directive(doc, directive, stored, adapter.name)
+            db.set_mission_agent(self.conn, mission_id, adapter.name)
+            db.log_event(
+                self.conn, mission_id=mission_id, kind="agent_migrated",
+                payload={"from": stored, "to": adapter.name},
+            )
+            log.info("mission %s migrated %s -> %s (handoff attached)",
+                     mission_id, stored, adapter.name)
+        hs = adapter.has_session(mission_id)
+        if hs is not None:
+            first = not hs
+        return directive, first, adapter
+
+    def _mark_launched(self, mission_id: str, agent_name: str) -> None:
+        self._turn_started[mission_id] = (db.now_ts(), agent_name)
+
     def _launch_oob(self, mission_id: str, payload: dict[str, Any]) -> None:
         try:
             first = not db.session_started(self.conn, mission_id)
-            runner.launch_step(mission_id, payload["directive"], first_step=first)
+            directive, first, adapter = self._pre_launch(
+                mission_id, payload["directive"], first)
+            runner.launch_step(mission_id, directive, first_step=first,
+                               adapter=adapter)
+            self._mark_launched(mission_id, adapter.name)
             db.log_event(
                 self.conn,
                 mission_id=mission_id,
@@ -230,10 +321,15 @@ class Engine:
             return
 
         try:
-            # The first Claude launch (step or OOB) creates the session with
-            # --session-id; everything after resumes it.
+            # The first launch (step or OOB) creates the session; everything
+            # after resumes it. _pre_launch may override using the adapter's
+            # has_session() and handles agent fallback/migration.
             session_first = not db.session_started(self.conn, mission_id)
-            runner.launch_step(mission_id, nxt["directive"], first_step=session_first)
+            directive, session_first, adapter = self._pre_launch(
+                mission_id, nxt["directive"], session_first)
+            runner.launch_step(mission_id, directive, first_step=session_first,
+                               adapter=adapter)
+            self._mark_launched(mission_id, adapter.name)
             db.set_step_state(self.conn, nxt["id"], "running", started=True)
             db.log_event(
                 self.conn,
@@ -316,7 +412,13 @@ class Engine:
         if config.AUTO_COMPACT_THRESHOLD <= 0:
             return False
         from . import agents
-        adapter = agents.get_adapter()
+        # Compact against the backend this mission's session lives on (it may
+        # be pinned to a non-global agent).
+        stored = (m["agent"] if "agent" in m.keys() else None) or "claude"
+        try:
+            adapter = agents.adapter_named(stored)
+        except Exception:  # noqa: BLE001
+            adapter = agents.get_adapter()
         if not adapter.supports_compact:
             return False
         mission_id = m["id"]
@@ -493,7 +595,10 @@ class Engine:
             if running is not None:
                 directive = config.RESUME_NOTIFY_PREFIX + running["directive"]
                 try:
-                    runner.launch_step(m["id"], directive, first_step=False)
+                    directive, first, adapter = self._pre_launch(m["id"], directive, False)
+                    runner.launch_step(m["id"], directive, first_step=first,
+                                       adapter=adapter)
+                    self._mark_launched(m["id"], adapter.name)
                     db.log_event(
                         self.conn,
                         mission_id=m["id"],

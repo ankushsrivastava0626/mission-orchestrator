@@ -133,6 +133,63 @@ def ctl_step_add(mission_id: str, directive: str, cue: str) -> None:
     click.echo(json.dumps(out, indent=2))
 
 
+@ctl_cli.group("agent")
+def ctl_agent() -> None:
+    """Show or switch the worker agent backend (claude/codex/gemini/api/custom)."""
+
+
+@ctl_agent.command("show")
+def ctl_agent_show() -> None:
+    """Current backend, last-known-good, and what's usable on this machine."""
+    with client.DaemonClient() as c:
+        st = c.call("agent.get", {})
+    click.echo(f"active     : {st['active']}")
+    click.echo(f"last good  : {st['last_good'] or '(none recorded yet)'}")
+    click.echo(f"fail streak: {st['consecutive_failures']}")
+    click.echo("backends:")
+    for name, b in st["backends"].items():
+        mark = "✓" if b["available"] else "✗"
+        click.echo(f"  {mark} {name:7} {'' if b['available'] else '- ' + b['reason']}")
+
+
+@ctl_agent.command("set")
+@click.argument("name")
+@click.option("--force", is_flag=True, help="switch even if the backend fails its availability check")
+def ctl_agent_set(name: str, force: bool) -> None:
+    """Switch the backend live, e.g. `orchctl agent set gemini`.
+
+    Persists to the config file; each running mission migrates on its next
+    wake - new session on the new agent, seeded with a handoff summary of its
+    old one. If the new agent turns out dead, orch auto-falls back to the
+    last backend that worked."""
+    try:
+        with client.DaemonClient() as c:
+            res = c.call("agent.set", {"agent": name, "force": force, "by": "cli"})
+    except client.DaemonError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"switched {res['from']} -> {res['to']} (saved to {res['persisted_to']})")
+    click.echo(res["note"])
+
+
+@ctl_agent.command("pin")
+@click.argument("mission_id")
+@click.argument("name")
+def ctl_agent_pin(mission_id: str, name: str) -> None:
+    """Pin ONE mission to a backend (others keep the global agent).
+    Use name '-' to clear the pin."""
+    try:
+        with client.DaemonClient() as c:
+            res = c.call("mission.set_agent",
+                         {"mission_id": mission_id,
+                          "agent": None if name == "-" else name})
+    except client.DaemonError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"pinned: {res['pinned'] or '(cleared - follows global)'}")
+    click.echo(res["note"])
+
+
 @ctl_cli.command("cancel")
 @click.argument("mission_id")
 def ctl_cancel(mission_id: str) -> None:

@@ -69,6 +69,7 @@ def _mission_actions_kb(state: str, sid: str) -> dict:
         rows.append([_btn("💬 reply / talk to worker", f"reply:{sid}")])
     rows.append([_btn("📞 calling name", f"callname:{sid}"),
                  _btn("🗜 compact", f"compact:{sid}")])
+    rows.append([_btn("🤖 agent for this mission", f"magent:{sid}")])
     if state == "running":
         rows.append([
             _btn("✋ soft cancel", f"cancel:{sid}"),
@@ -421,6 +422,59 @@ class TelegramHost:
             f"in a minute to see the new size.",
         )
 
+    async def _prompt_mission_agent(
+        self, client: httpx.AsyncClient, chat_id: str, sid: str,
+    ) -> None:
+        """Per-mission agent picker: pin this one mission to a backend while
+        every other mission keeps the global agent."""
+        try:
+            mid = self._resolve_mid(sid)
+        except CommandError as e:
+            await self._send(client, chat_id, f"❌ {e}")
+            return
+        row = self.daemon.conn.execute(
+            "SELECT name, agent, pinned_agent FROM missions WHERE id = ?", (mid,)
+        ).fetchone()
+        st = self._rpc("agent.get", {})
+        cur = row["pinned_agent"] or f"global ({st['active']})"
+        lines = [f"🤖 *{row['name']}* - worker AI for this mission only",
+                 f"now: *{cur}*  (session lives on: {row['agent'] or 'claude'})",
+                 "", "pick a backend (✅ = usable on this machine):"]
+        kb_rows: list[list[dict]] = []
+        for name, b in st["backends"].items():
+            mark = "✅" if b["available"] else "🚫"
+            kb_rows.append([_btn(f"{mark} {name}", f"magentset:{sid}:{name}")])
+        kb_rows.append([_btn("🌐 use global agent", f"magentset:{sid}:-")])
+        kb_rows.append([_btn("← back", f"m:{sid}")])
+        await self._send(client, chat_id, "\n".join(lines), markup=_ikb(kb_rows))
+
+    async def _set_mission_agent(
+        self, client: httpx.AsyncClient, chat_id: str, arg: str,
+    ) -> None:
+        sid, _, name = arg.partition(":")
+        try:
+            mid = self._resolve_mid(sid)
+            res = self._rpc("mission.set_agent", {"mission_id": mid, "agent":
+                                                  None if name == "-" else name})
+        except Exception as e:  # noqa: BLE001
+            await self._send(client, chat_id, f"❌ {e}")
+            return
+        row = self.daemon.conn.execute(
+            "SELECT name FROM missions WHERE id=?", (mid,)).fetchone()
+        mname = row["name"] if row else sid
+        if res.get("pinned"):
+            await self._send(
+                client, chat_id,
+                f"🤖 *{mname}* pinned to *{res['pinned']}* - it migrates on its "
+                f"next wake (fresh session + handoff notes). All other missions "
+                f"stay on the global agent.",
+            )
+        else:
+            await self._send(
+                client, chat_id,
+                f"🌐 *{mname}* follows the global agent again.",
+            )
+
     async def _prompt_call_name(
         self, client: httpx.AsyncClient, chat_id: str, sid: str,
     ) -> None:
@@ -575,6 +629,10 @@ class TelegramHost:
             await self._prompt_call_name(client, chat_id, arg)
         elif action == "compact":
             await self._do_compact(client, chat_id, arg)
+        elif action == "magent":
+            await self._prompt_mission_agent(client, chat_id, arg)
+        elif action == "magentset":
+            await self._set_mission_agent(client, chat_id, arg)
         else:
             await self._send(client, chat_id, f"❌ unknown action `{action}`")
 
@@ -906,6 +964,7 @@ def _cmd_helptext(self: TelegramHost, args: list[str]) -> str:
         "*all commands*\n"
         "`/missions` - list all missions (also gives a button menu)\n"
         "`/context` - all missions + their live context-token size\n"
+        "`/agent [name]` - show or switch the worker AI backend\n"
         "`/m <id>` - mission detail with action buttons\n"
         "`/create <name>` - create mission\n"
         "`/step <id> <directive…>` - add a step (cue auto-detected)\n"
@@ -951,6 +1010,29 @@ def _cmd_missions(self: TelegramHost, args: list[str]) -> Reply:
             f"`{_short(r['id'])}` {marker} {r['state']:10} {r['name']}"
         )
     return Reply(text="\n".join(lines), markup=_missions_list_kb(rows))
+
+
+def _cmd_agent(self: TelegramHost, args: list[str]) -> str:
+    """Show or switch the worker agent backend: /agent [claude|codex|gemini|api|custom]"""
+    if args:
+        try:
+            res = self._rpc("agent.set", {"agent": args[0], "by": "telegram"})
+        except Exception as e:  # noqa: BLE001
+            return f"❌ {e}"
+        return (f"🤖 agent switched *{res['from']}* → *{res['to']}*.\n"
+                f"Running missions migrate on their next wake (fresh session + "
+                f"handoff notes). If *{res['to']}* turns out broken, orch falls "
+                f"back to the last agent that worked.")
+    st = self._rpc("agent.get", {})
+    lines = [f"🤖 active agent: *{st['active']}*",
+             f"last good: {st['last_good'] or '(none yet)'}"]
+    lines.append("\nbackends on this machine:")
+    for name, b in st["backends"].items():
+        mark = "✅" if b["available"] else "🚫"
+        extra = "" if b["available"] else f" - {b['reason']}"
+        lines.append(f"  {mark} `{name}`{extra}")
+    lines.append("\nswitch with `/agent <name>`")
+    return "\n".join(lines)
 
 
 def _cmd_context(self: TelegramHost, args: list[str]) -> Reply:
@@ -1002,10 +1084,13 @@ def _cmd_get(self: TelegramHost, args: list[str]) -> Reply:
     snap = self._rpc("mission.get", {"mission_id": mid})
     m = snap["mission"]
     cname = m.get("call_name")
+    pinned = m.get("pinned_agent")
+    agent_line = (f"agent: {m.get('agent') or 'claude'}"
+                  + (f"  📌 pinned: {pinned}" if pinned else "  (global)"))
     lines = [
         f"*{m['name']}*  `{_short(mid)}`",
         f"state: {m['state']}  restarts: {m['restart_count']}",
-        f"heartbeat: every {m['heartbeat_interval_s']}s",
+        f"heartbeat: every {m['heartbeat_interval_s']}s  |  {agent_line}",
         f"chat: {m['telegram_chat_id']}" + (f"  caller: {cname}" if cname else ""),
     ]
     try:
@@ -1143,6 +1228,7 @@ _COMMANDS: dict[str, CommandFn] = {
     "context": _cmd_context,
     "tokens": _cmd_context,
     "ctx": _cmd_context,
+    "agent": _cmd_agent,
     "m": _cmd_get,
     "get": _cmd_get,
     "create": _cmd_create,

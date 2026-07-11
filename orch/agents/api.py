@@ -31,6 +31,17 @@ class ApiAdapter(Adapter):
     name = "api"
     supports_compact = True
 
+    def available(self) -> tuple[bool, str]:
+        provider = (os.environ.get("ORCH_API_PROVIDER") or "anthropic").lower()
+        key = (os.environ.get("ORCH_API_KEY")
+               or os.environ.get("ANTHROPIC_API_KEY" if provider == "anthropic"
+                                 else "OPENAI_API_KEY"))
+        if not key:
+            return False, "no API key (ORCH_API_KEY)"
+        if provider != "anthropic" and not os.environ.get("ORCH_API_MODEL"):
+            return False, "ORCH_API_MODEL required for openai-compatible providers"
+        return True, "ok"
+
     def step_cmd(self, mission_id: str, directive: str, first: bool) -> str:
         py = self.q(sys.executable)
         return (
@@ -57,6 +68,11 @@ class ApiAdapter(Adapter):
     def session_path(self, mission_id: str) -> str | None:
         f = session_file(mission_id)
         return str(f) if f.exists() else None
+
+    def has_session(self, mission_id: str) -> bool | None:
+        # The api worker appends to its session json regardless of first/resume,
+        # so create-vs-resume is moot - report reality anyway.
+        return session_file(mission_id).exists()
 
     def compact(self, mission_id: str) -> bool:
         logf = open(os.path.expanduser(f"~/.orch/compact-{mission_id}.log"), "ab")

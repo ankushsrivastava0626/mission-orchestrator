@@ -125,6 +125,43 @@ def init_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE missions ADD COLUMN call_name TEXT")
     if "tg_topic_id" not in cols:
         conn.execute("ALTER TABLE missions ADD COLUMN tg_topic_id INTEGER")
+    if "agent" not in cols:
+        # Which backend this mission's session lives on. Pre-adapter DBs ran
+        # everything on Claude Code, so backfill 'claude'.
+        conn.execute("ALTER TABLE missions ADD COLUMN agent TEXT")
+        conn.execute("UPDATE missions SET agent = 'claude' WHERE agent IS NULL")
+    if "pinned_agent" not in cols:
+        # Per-mission backend override: when set, this mission launches on
+        # this backend regardless of the global ORCH_AGENT.
+        conn.execute("ALTER TABLE missions ADD COLUMN pinned_agent TEXT")
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)"
+    )
+
+
+def get_meta(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
+    row = conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?, ?)"
+        " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value),
+    )
+
+
+def set_mission_agent(conn: sqlite3.Connection, mission_id: str, agent: str) -> None:
+    conn.execute("UPDATE missions SET agent = ? WHERE id = ?", (agent, mission_id))
+
+
+def set_mission_pinned_agent(
+    conn: sqlite3.Connection, mission_id: str, agent: str | None
+) -> None:
+    conn.execute(
+        "UPDATE missions SET pinned_agent = ? WHERE id = ?", (agent, mission_id)
+    )
 
 
 def set_mission_call_name(conn: sqlite3.Connection, mission_id: str, name: str | None) -> None:

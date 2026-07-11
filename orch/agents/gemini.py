@@ -24,6 +24,12 @@ RESUME_ARGS = os.environ.get("ORCH_GEMINI_RESUME_ARGS", "--resume latest")
 class GeminiAdapter(Adapter):
     name = "gemini"
 
+    def available(self) -> tuple[bool, str]:
+        import shutil as _sh
+        if _sh.which(GEMINI_BIN):
+            return True, "ok"
+        return False, f"`{GEMINI_BIN}` not found on PATH"
+
     def _workdir(self, mission_id: str) -> Path:
         return config.worker_tmpdir(mission_id) / "gemini-work"
 
