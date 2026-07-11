@@ -70,10 +70,11 @@ class CodexAdapter(Adapter):
     def step_cmd(self, mission_id: str, directive: str, first: bool) -> str:
         home = self._home(mission_id)
         sub = "exec" if first else "exec resume --last"
+        # --yolo = codex's alias for --dangerously-bypass-approvals-and-sandbox.
         # ORCH_MISSION_ID in the env keeps the mission id visible to pgrep.
         return (
             f"env CODEX_HOME={self.q(str(home))} ORCH_MISSION_ID={mission_id}"
-            f" {CODEX_BIN} {sub} --dangerously-bypass-approvals-and-sandbox"
+            f" {CODEX_BIN} {sub} --yolo"
             f" --skip-git-repo-check {self.q(directive)}"
         )
 

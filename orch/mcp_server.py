@@ -243,7 +243,7 @@ HOST_TOOLS: list[Tool] = [
         ),
         inputSchema=_obj(
             {"agent": {"type": "string",
-                       "enum": ["claude", "codex", "gemini", "api", "custom"]},
+                       "enum": ["claude", "codex", "antigravity", "gemini", "api", "custom"]},
              "force": {"type": "boolean"}},
             ["agent"],
         ),

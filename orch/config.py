@@ -36,6 +36,12 @@ def _load_env_file() -> None:
 
 _load_env_file()
 
+# Agent CLIs (claude, codex, agy, …) typically install into ~/.local/bin,
+# which systemd's minimal PATH lacks - make sure the daemon can find them.
+_local_bin = str(HOME / ".local" / "bin")
+if _local_bin not in os.environ.get("PATH", "").split(":"):
+    os.environ["PATH"] = os.environ.get("PATH", "") + ":" + _local_bin
+
 
 def active_env_file() -> str:
     """The env file live config changes should be written to."""

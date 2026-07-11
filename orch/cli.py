@@ -321,5 +321,98 @@ def owatch_main() -> None:
     owatch_cli()
 
 
+# ---------- oworker (worker toolkit over the daemon socket) ----------
+#
+# Shell bridge for agent backends that can't load MCP servers (Antigravity's
+# agy, custom CLIs): every worker tool as a command. Mission identity comes
+# from ORCH_MISSION_ID in the worker's environment.
+
+
+@click.group()
+def oworker_cli() -> None:
+    """Worker toolkit - notify the user, send files, queue future steps."""
+
+
+def _oworker_call(method: str, params: dict) -> object:
+    mid = _msec_mission_id()
+    with client.DaemonClient() as c:
+        return c.call(method, {"mission_id": mid, **params})
+
+
+@oworker_cli.command("notify")
+@click.argument("text")
+def oworker_notify(text: str) -> None:
+    """Send a Telegram message to the user."""
+    _oworker_call("notify", {"text": text})
+    click.echo("sent")
+
+
+@oworker_cli.command("send-file")
+@click.argument("path")
+@click.option("--caption", default="")
+def oworker_send_file(path: str, caption: str) -> None:
+    """Send a file (any type; images show inline) to the user."""
+    _oworker_call("notify_file", {"path": path, "caption": caption})
+    click.echo("sent")
+
+
+@oworker_cli.command("message-host")
+@click.argument("text")
+@click.option("--file", "files", multiple=True, help="attach a file (repeatable)")
+def oworker_message_host(text: str, files: tuple[str, ...]) -> None:
+    """Message the orchestrating host's mailbox (not the human)."""
+    res = _oworker_call("host.message", {"text": text, "files": list(files)})
+    click.echo(json.dumps(res))
+
+
+@oworker_cli.command("queue-add")
+@click.argument("directive")
+@click.option("--at", default=None, help='absolute time "YYYY-MM-DD HH:MM" (local)')
+@click.option("--in", "in_s", type=int, default=None, help="seconds after the current step started")
+@click.option("--next", "run_next", is_flag=True, help="run right after the current step")
+def oworker_queue_add(directive: str, at: str | None, in_s: int | None, run_next: bool) -> None:
+    """Queue a future step for yourself (this is how you self-schedule)."""
+    if at:
+        cue: dict = {"type": "at_time", "at": at}
+    elif in_s:
+        cue = {"type": "on_timeout", "seconds": in_s}
+    elif run_next:
+        cue = {"type": "on_current_complete"}
+    else:
+        cue = {"type": "on_current_complete"}
+    res = _oworker_call("step.add", {"directive": directive, "cue": cue,
+                                     "created_by": "worker"})
+    click.echo(json.dumps(res))
+
+
+@oworker_cli.command("queue-list")
+def oworker_queue_list() -> None:
+    """List this mission's steps."""
+    click.echo(json.dumps(_oworker_call("step.list", {}), default=str))
+
+
+@oworker_cli.command("status")
+def oworker_status() -> None:
+    """This mission's full state."""
+    click.echo(json.dumps(_oworker_call("mission.get", {}), default=str))
+
+
+@oworker_cli.command("heartbeat-set")
+@click.argument("interval_s", type=int)
+def oworker_heartbeat_set(interval_s: int) -> None:
+    """Set the heartbeat interval in seconds."""
+    click.echo(json.dumps(_oworker_call("heartbeat.set", {"interval_s": interval_s})))
+
+
+@oworker_cli.command("location")
+def oworker_location() -> None:
+    """The user's latest shared location, if any."""
+    click.echo(json.dumps(_oworker_call("location.get", {})))
+
+
+def oworker_main() -> None:
+    oworker_cli()
+
+
 if __name__ == "__main__":  # pragma: no cover
     daemon_main()
