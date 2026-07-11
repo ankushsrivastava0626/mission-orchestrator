@@ -56,7 +56,12 @@ class AntigravityAdapter(Adapter):
 
     def step_cmd(self, mission_id: str, directive: str, first: bool) -> str:
         wd = self._workdir(mission_id)
-        cont = "" if first else " --continue"
+        cont = ""
+        if not first:
+            # Resume the mission's own conversation by id when we can map it
+            # (robust against other agy usage); fall back to --continue.
+            cid = self._conversation_id(mission_id)
+            cont = f" --conversation {cid}" if cid else " --continue"
         return (
             f"cd {self.q(str(wd))} && env ORCH_MISSION_ID={mission_id}"
             f" {AGY_BIN} --dangerously-skip-permissions{cont}"
@@ -67,9 +72,73 @@ class AntigravityAdapter(Adapter):
         return "agy" in line and mission_id in line
 
     def has_session(self, mission_id: str) -> bool | None:
-        # agy stores conversations in ~/.gemini/antigravity-cli/conversations
-        # as opaque per-id SQLite DBs with no exposed cwd mapping - we can't
-        # cheaply tell which belongs to this mission. Return None so the
-        # engine falls back to DB history (first launch = create, then
-        # --continue), which is correct for agy's per-workdir continuity.
+        return self._conversation_id(mission_id) is not None
+
+    # ---- conversation mapping + context estimate -------------------------
+    #
+    # agy stores conversations in ~/.gemini/antigravity-cli/conversations as
+    # per-id SQLite DBs of protobuf blobs. There is no exposed cwd index, but
+    # the mission's unique workdir path appears inside its conversation's
+    # metadata - scanning for it identifies the conversation exactly (verified
+    # live). The id is cached in the workdir to avoid rescanning.
+
+    def on_rebuild(self, mission_id: str) -> None:
+        cache = self._workdir(mission_id) / ".agy-conversation"
+        try:
+            cache.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _conv_dir(self) -> str:
+        return os.path.expanduser("~/.gemini/antigravity-cli/conversations")
+
+    def _conversation_id(self, mission_id: str) -> str | None:
+        import glob
+        wd = self._workdir(mission_id)
+        cache = wd / ".agy-conversation"
+        if cache.exists():
+            cid = cache.read_text().strip()
+            if cid and os.path.isfile(os.path.join(self._conv_dir(), cid + ".db")):
+                return cid
+        needle = f"agy-{mission_id}".encode()
+        hits = sorted(glob.glob(self._conv_dir() + "/*.db"),
+                      key=os.path.getmtime, reverse=True)
+        for db in hits:
+            try:
+                if needle in open(db, "rb").read():
+                    cid = os.path.basename(db)[:-3]
+                    try:
+                        wd.mkdir(parents=True, exist_ok=True)
+                        cache.write_text(cid)
+                    except OSError:
+                        pass
+                    return cid
+            except OSError:
+                continue
         return None
+
+    def session_path(self, mission_id: str) -> str | None:
+        cid = self._conversation_id(mission_id)
+        return os.path.join(self._conv_dir(), cid + ".db") if cid else None
+
+    def context_tokens(self, mission_id: str) -> tuple[int, int] | None:
+        """ESTIMATE. agy's protobuf blobs expose no token counts, so this
+        approximates from the conversation DB size (~5 bytes/token across
+        text+overhead). Good enough to display and to trigger the rebuild
+        compaction at the threshold; not billing-grade."""
+        path = self.session_path(mission_id)
+        if not path:
+            return None
+        try:
+            import sqlite3 as _sq
+            size = os.path.getsize(path)
+            steps = 0
+            try:
+                c = _sq.connect(path)
+                steps = c.execute("SELECT COUNT(*) FROM steps").fetchone()[0]
+                c.close()
+            except Exception:
+                pass
+            return size // 5, steps
+        except OSError:
+            return None

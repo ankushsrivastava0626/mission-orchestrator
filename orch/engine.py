@@ -215,16 +215,35 @@ class Engine:
                     f"agent '{adapter.name}' unavailable ({reason}) and no "
                     f"working fallback recorded")
         stored = ((m["agent"] if "agent" in m.keys() else None) or "claude")
+        rebuild_key = f"rebuild:{mission_id}"
         if agents.canonical(stored) != adapter.name:
             doc = handoff.build_handoff(self.conn, mission_id, stored, adapter.name)
             directive = handoff.wrap_directive(doc, directive, stored, adapter.name)
             db.set_mission_agent(self.conn, mission_id, adapter.name)
+            db.set_meta(self.conn, rebuild_key, "0")  # migration IS a rebuild
             db.log_event(
                 self.conn, mission_id=mission_id, kind="agent_migrated",
                 payload={"from": stored, "to": adapter.name},
             )
             log.info("mission %s migrated %s -> %s (handoff attached)",
                      mission_id, stored, adapter.name)
+            adapter.on_rebuild(mission_id)
+            # If the new backend still has an old session for this mission
+            # (switching BACK), resume it - otherwise create fresh.
+            hs = adapter.has_session(mission_id)
+            return directive, (True if hs is None else not hs), adapter
+        if db.get_meta(self.conn, rebuild_key) == "1":
+            # Rebuild-compact: fresh session on the SAME backend, seeded with
+            # handoff notes - the compaction fallback for backends without a
+            # native /compact (and available to all).
+            db.set_meta(self.conn, rebuild_key, "0")
+            doc = handoff.build_handoff(self.conn, mission_id, stored, adapter.name)
+            directive = handoff.wrap_directive(doc, directive, stored, adapter.name)
+            adapter.on_rebuild(mission_id)
+            db.log_event(self.conn, mission_id=mission_id, kind="session_rebuilt")
+            log.info("mission %s: session rebuilt (compaction fallback)", mission_id)
+            # Rebuild must be a FRESH session (that's the whole point).
+            return directive, True, adapter
         hs = adapter.has_session(mission_id)
         if hs is not None:
             first = not hs
@@ -419,8 +438,6 @@ class Engine:
             adapter = agents.adapter_named(stored)
         except Exception:  # noqa: BLE001
             adapter = agents.get_adapter()
-        if not adapter.supports_compact:
-            return False
         mission_id = m["id"]
         # Cheap gates first (don't spend the throttle window on a busy mission).
         if runner.step_running(mission_id):
@@ -449,13 +466,20 @@ class Engine:
         ).fetchone()
         if recent is not None:
             return False
-        adapter.compact(mission_id)
+        if adapter.supports_compact:
+            adapter.compact(mission_id)
+            mode = "native"
+        else:
+            # No native /compact on this backend - schedule a session REBUILD
+            # (fresh session + handoff notes) for the mission's next wake.
+            db.set_meta(self.conn, f"rebuild:{mission_id}", "1")
+            mode = "rebuild"
         db.log_event(
             self.conn, mission_id=mission_id, kind="compact_started",
-            payload={"before_tokens": tokens, "auto": True,
+            payload={"before_tokens": tokens, "auto": True, "mode": mode,
                      "threshold": config.AUTO_COMPACT_THRESHOLD},
         )
-        log.info("auto-compact: mission %s at ~%d tokens", mission_id, tokens)
+        log.info("auto-compact (%s): mission %s at ~%d tokens", mode, mission_id, tokens)
         return True
 
     # ---------- mission completion ----------

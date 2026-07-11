@@ -38,6 +38,10 @@ class Adapter:
     def cleanup(self, mission_id: str) -> None:
         """Remove per-mission scratch state (called at mission teardown)."""
 
+    def on_rebuild(self, mission_id: str) -> None:
+        """Called when the mission's session is being rebuilt fresh (rebuild
+        compaction or migration) - drop any cached session identity."""
+
     # ---- observability ---------------------------------------------------
 
     def is_running_line(self, line: str, mission_id: str) -> bool:

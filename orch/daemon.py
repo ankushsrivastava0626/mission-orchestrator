@@ -484,20 +484,27 @@ def h_mission_compact(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     (mission_id,) = _require(p, "mission_id")
     m = _mission_or_raise(d.conn, mission_id)
     adapter = _mission_adapter(m)
-    if not adapter.supports_compact:
-        raise RPCError("unsupported",
-                       f"the {adapter.name} backend doesn't support compaction")
     if runner.step_running(mission_id):
         raise RPCError("busy", "the worker is mid-turn; try again when idle")
     ct = adapter.context_tokens(mission_id)
     before = ct[0] if ct else 0
-    if not adapter.compact(mission_id):
-        raise RPCError("compact_failed", "backend refused to start a compaction")
+    if adapter.supports_compact:
+        if not adapter.compact(mission_id):
+            raise RPCError("compact_failed", "backend refused to start a compaction")
+        mode = "native"
+    else:
+        # Universal fallback: mark the mission for a session REBUILD - its
+        # next wake starts a fresh session seeded with handoff notes (mission
+        # state + step history + conversation tail). Works on any backend.
+        db.set_meta(d.conn, f"rebuild:{mission_id}", "1")
+        mode = "rebuild"
     db.log_event(
         d.conn, mission_id=mission_id, kind="compact_started",
-        payload={"before_tokens": before, "auto": False},
+        payload={"before_tokens": before, "auto": False, "mode": mode},
     )
-    return {"ok": True, "started": True, "before_tokens": before}
+    return {"ok": True, "started": True, "before_tokens": before, "mode": mode,
+            **({"note": "rebuild scheduled - applies on the mission's next wake"}
+               if mode == "rebuild" else {})}
 
 
 def h_location_get(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
