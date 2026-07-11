@@ -38,9 +38,25 @@ _load_env_file()
 
 # Agent CLIs (claude, codex, agy, …) typically install into ~/.local/bin,
 # which systemd's minimal PATH lacks - make sure the daemon can find them.
-_local_bin = str(HOME / ".local" / "bin")
-if _local_bin not in os.environ.get("PATH", "").split(":"):
-    os.environ["PATH"] = os.environ.get("PATH", "") + ":" + _local_bin
+for _extra_bin in (str(HOME / ".local" / "bin"), str(HOME / ".opencode" / "bin")):
+    if _extra_bin not in os.environ.get("PATH", "").split(":"):
+        os.environ["PATH"] = os.environ.get("PATH", "") + ":" + _extra_bin
+
+
+def _env_int(var: str, default: int) -> int:
+    try:
+        return int(os.environ.get(var, "") or default)
+    except ValueError:
+        return default
+
+
+def _env_float(var: str, default: float) -> float:
+    try:
+        return float(os.environ.get(var, "") or default)
+    except ValueError:
+        return default
+
+
 
 
 def active_env_file() -> str:
@@ -90,8 +106,8 @@ EXTRA_WORKER_MCPS_PATH = Path(
 TMUX_PREFIX = "mission-"
 WORKER_TMP_PREFIX = "/tmp/orch-"
 
-HEARTBEAT_DEFAULT_S = 86_400
-HEARTBEAT_MAX_S = 86_400
+HEARTBEAT_DEFAULT_S = _env_int("ORCH_HEARTBEAT_DEFAULT_S", 86_400)
+HEARTBEAT_MAX_S = _env_int("ORCH_HEARTBEAT_MAX_S", 86_400)
 HEARTBEAT_DIRECTIVE = (
     "Send a brief status update to the user via Telegram. Use the `notify` tool "
     "from the orch MCP server. Include what you're currently working on and any "
@@ -168,16 +184,25 @@ CANCEL_GOODBYE_DIRECTIVE = (
     "mission will be torn down immediately after you exit."
 )
 
-TICK_INTERVAL_S = 1.0
-MAX_RESTARTS = 5
+TICK_INTERVAL_S = _env_float("ORCH_TICK_INTERVAL_S", 1.0)
+MAX_RESTARTS = _env_int("ORCH_MAX_RESTARTS", 5)
 
 # Auto-compaction: when an idle worker's live context crosses this many tokens,
 # the engine fires a headless /compact so future wakes stay cheap. Set to 0 to
 # disable. CHECK_S throttles the (file-reading) measurement per mission;
 # COOLDOWN_S prevents re-firing while a compaction is still settling.
-AUTO_COMPACT_THRESHOLD = 200_000
-AUTO_COMPACT_CHECK_S = 60
-AUTO_COMPACT_COOLDOWN_S = 600
+AUTO_COMPACT_THRESHOLD = _env_int("ORCH_AUTO_COMPACT_THRESHOLD", 200_000)
+AUTO_COMPACT_CHECK_S = _env_int("ORCH_AUTO_COMPACT_CHECK_S", 60)
+AUTO_COMPACT_COOLDOWN_S = _env_int("ORCH_AUTO_COMPACT_COOLDOWN_S", 600)
+
+# Agent health: consecutive dead turns before fallback/unpin, and how short a
+# quiet turn must be to count as dead (longer quiet turns are neutral).
+AGENT_FAIL_LIMIT = _env_int("ORCH_AGENT_FAIL_LIMIT", 2)
+AGENT_FAST_FAIL_S = _env_int("ORCH_AGENT_FAST_FAIL_S", 45)
+
+# Cross-agent handoff document sizing.
+HANDOFF_TAIL_CHARS = _env_int("ORCH_HANDOFF_TAIL_CHARS", 6000)
+HANDOFF_CAP_CHARS = _env_int("ORCH_HANDOFF_CAP_CHARS", 9000)
 
 ENV_MASTER_PASSPHRASE = "ORCH_MASTER_PASSPHRASE"
 ENV_TELEGRAM_TOKEN = "ORCH_TELEGRAM_BOT_TOKEN"
@@ -195,7 +220,7 @@ ENV_TOPICS_CHAT_ID = "ORCH_TOPICS_CHAT_ID"
 
 # Rapid user messages to the same mission within this many seconds are coalesced
 # into ONE directive, so the worker wakes once with all of them.
-REPLY_COALESCE_S = 5.0
+REPLY_COALESCE_S = _env_float("ORCH_REPLY_COALESCE_S", 5.0)
 
 
 def default_chat_id() -> str | None:
@@ -227,3 +252,88 @@ def worker_tmpdir(mission_id: str) -> Path:
 
 def ensure_dirs() -> None:
     ORCH_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# Settings registry - the single source of truth for `orchctl config`.
+# key -> (env var, type, default, attr-on-this-module-or-None, description)
+# attr set => the daemon live-applies changes by rebinding config.<attr>;
+# attr None => the value is read from os.environ at call time anyway.
+SETTINGS: dict[str, tuple[str, str, str, str | None, str]] = {
+    # behavior tunables
+    "auto_compact_threshold": ("ORCH_AUTO_COMPACT_THRESHOLD", "int", "200000",
+                               "AUTO_COMPACT_THRESHOLD",
+                               "tokens at which an idle worker auto-compacts (0=off)"),
+    "auto_compact_check_s": ("ORCH_AUTO_COMPACT_CHECK_S", "int", "60",
+                             "AUTO_COMPACT_CHECK_S",
+                             "seconds between context-size measurements per mission"),
+    "auto_compact_cooldown_s": ("ORCH_AUTO_COMPACT_COOLDOWN_S", "int", "600",
+                                "AUTO_COMPACT_COOLDOWN_S",
+                                "wait after a compaction before another may fire"),
+    "reply_coalesce_s": ("ORCH_REPLY_COALESCE_S", "float", "5.0",
+                         "REPLY_COALESCE_S",
+                         "window merging rapid Telegram messages into one directive"),
+    "heartbeat_default_s": ("ORCH_HEARTBEAT_DEFAULT_S", "int", "86400",
+                            "HEARTBEAT_DEFAULT_S",
+                            "heartbeat interval for new missions"),
+    "heartbeat_max_s": ("ORCH_HEARTBEAT_MAX_S", "int", "86400",
+                        "HEARTBEAT_MAX_S", "ceiling for heartbeat.set"),
+    "max_restarts": ("ORCH_MAX_RESTARTS", "int", "5", "MAX_RESTARTS",
+                     "crash-recovery attempts before a mission is failed"),
+    "tick_interval_s": ("ORCH_TICK_INTERVAL_S", "float", "1.0",
+                        "TICK_INTERVAL_S", "engine scheduler tick"),
+    "agent_fail_limit": ("ORCH_AGENT_FAIL_LIMIT", "int", "2",
+                         "AGENT_FAIL_LIMIT",
+                         "consecutive dead turns before fallback/unpin"),
+    "agent_fast_fail_s": ("ORCH_AGENT_FAST_FAIL_S", "int", "45",
+                          "AGENT_FAST_FAIL_S",
+                          "quiet turns shorter than this count as dead"),
+    "handoff_tail_chars": ("ORCH_HANDOFF_TAIL_CHARS", "int", "6000",
+                           "HANDOFF_TAIL_CHARS",
+                           "old-conversation tail included in migration handoffs"),
+    "handoff_cap_chars": ("ORCH_HANDOFF_CAP_CHARS", "int", "9000",
+                          "HANDOFF_CAP_CHARS", "total handoff document cap"),
+    # identity / integration (env-read at call time; no live attr needed)
+    "agent": ("ORCH_AGENT", "str", "claude", None,
+              "global worker backend (prefer `orchctl agent set`)"),
+    "api_provider": ("ORCH_API_PROVIDER", "str", "anthropic", None,
+                     "api backend: anthropic | openai(-compatible)"),
+    "api_key": ("ORCH_API_KEY", "secret", "", None, "api backend key"),
+    "api_model": ("ORCH_API_MODEL", "str", "", None,
+                  "api backend model id (e.g. openrouter model)"),
+    "api_base_url": ("ORCH_API_BASE_URL", "str", "", None,
+                     "api backend endpoint (e.g. https://openrouter.ai/api/v1)"),
+    "custom_first_cmd": ("ORCH_CUSTOM_FIRST_CMD", "str", "", None,
+                         "custom backend first-launch template"),
+    "custom_resume_cmd": ("ORCH_CUSTOM_RESUME_CMD", "str", "", None,
+                          "custom backend resume template"),
+    "claude_bin": ("ORCH_CLAUDE_BIN", "str", "claude", None, "claude CLI binary"),
+    "codex_bin": ("ORCH_CODEX_BIN", "str", "codex", None, "codex CLI binary"),
+    "agy_bin": ("ORCH_AGY_BIN", "str", "agy", None, "antigravity CLI binary"),
+    "gemini_bin": ("ORCH_GEMINI_BIN", "str", "gemini", None, "gemini CLI binary"),
+    "gemini_resume_args": ("ORCH_GEMINI_RESUME_ARGS", "str", "--resume latest",
+                           None, "gemini CLI resume flags"),
+    "gemini_api_key": ("GEMINI_API_KEY", "secret", "", None,
+                       "forwarded to gemini workers for headless auth"),
+    "opencode_bin": ("ORCH_OPENCODE_BIN", "str", "opencode", None,
+                     "opencode CLI binary"),
+    "opencode_model": ("ORCH_OPENCODE_MODEL", "str", "", None,
+                       "opencode model, e.g. openrouter/anthropic/claude-sonnet-4.5"),
+    "openrouter_api_key": ("OPENROUTER_API_KEY", "secret", "", None,
+                           "forwarded to opencode workers (any model, one key)"),
+    "host_bot_token": ("ORCH_HOST_BOT_TOKEN", "secret", "", None,
+                       "Telegram command bot token"),
+    "allowed_chat_ids": ("ORCH_HOST_ALLOWED_CHAT_IDS", "str", "", None,
+                         "comma-separated Telegram chat ids allowed to command"),
+    "default_chat_id": ("ORCH_DEFAULT_CHAT_ID", "str", "", None,
+                        "default chat for worker notifications"),
+    "topics_chat_id": ("ORCH_TOPICS_CHAT_ID", "str", "", None,
+                       "forum supergroup for per-mission topics"),
+    "notify_bot_token": ("ORCH_TELEGRAM_BOT_TOKEN", "secret", "", None,
+                         "legacy notification bot token (fallback)"),
+    "master_passphrase": ("ORCH_MASTER_PASSPHRASE", "secret", "", None,
+                          "secrets-vault master passphrase"),
+    "extra_worker_mcps": ("ORCH_EXTRA_WORKER_MCPS", "str",
+                          "/etc/orch/worker_mcp.json", None,
+                          "JSON file of extra MCP servers for all workers"),
+}

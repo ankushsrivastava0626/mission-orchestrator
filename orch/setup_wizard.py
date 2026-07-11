@@ -25,9 +25,10 @@ AGENTS = {
     "1": ("claude", "Claude Code CLI (needs `claude` installed & logged in)"),
     "2": ("codex", "OpenAI Codex CLI (needs `codex` installed & logged in)"),
     "3": ("antigravity", "Google Antigravity (needs `agy` installed & logged in)"),
-    "4": ("gemini", "Gemini CLI (needs `gemini` installed & logged in)"),
-    "5": ("api", "No CLI - raw API key (Anthropic or any OpenAI-compatible)"),
-    "6": ("custom", "Custom - any agent CLI via command templates"),
+    "4": ("opencode", "OpenCode - open-source harness, any model (OpenRouter/local)"),
+    "5": ("gemini", "Gemini CLI (needs `gemini` installed & logged in)"),
+    "6": ("api", "No CLI - raw API key (Anthropic or any OpenAI-compatible)"),
+    "7": ("custom", "Custom - any agent CLI via command templates"),
 }
 
 
@@ -113,7 +114,7 @@ def run_wizard() -> None:
         env["ORCH_CUSTOM_RESUME_CMD"] = _ask("resume command template",
                                              env["ORCH_CUSTOM_FIRST_CMD"])
     else:
-        binmap = {"claude": "claude", "codex": "codex", "gemini": "gemini", "antigravity": "agy"}
+        binmap = {"claude": "claude", "codex": "codex", "gemini": "gemini", "antigravity": "agy", "opencode": "opencode"}
         if shutil.which(binmap[agent]) is None:
             print(f"    ⚠ `{binmap[agent]}` not found on PATH - install it before starting missions.")
 

@@ -6,7 +6,7 @@
   one by one via handoff on their next wake; see engine._pre_launch).
 - record_turn_result(): tracks whether worker turns actually produce activity.
   A turn that dies fast with zero worker activity counts as a failure; after
-  FAIL_LIMIT consecutive failures the daemon auto-reverts to the last agent
+  config.AGENT_FAIL_LIMIT consecutive failures the daemon auto-reverts to the last agent
   that demonstrably worked ("fallback to whichever last worked").
 """
 
@@ -22,10 +22,6 @@ log = logging.getLogger(__name__)
 
 META_LAST_GOOD = "last_good_agent"
 META_FAILS = "agent_consecutive_failures"
-FAIL_LIMIT = 2
-# A quiet turn shorter than this smells like a broken backend (CLI missing,
-# auth expired, bad flags). Longer quiet turns are treated as neutral.
-FAST_FAIL_S = 45
 
 
 def status(conn: sqlite3.Connection) -> dict:
@@ -84,13 +80,13 @@ def record_turn_result(conn: sqlite3.Connection, mission_id: str,
         if produced:
             db.set_meta(conn, key, "0")
             return
-        if ended_ts - started_ts >= FAST_FAIL_S:
+        if ended_ts - started_ts >= config.AGENT_FAST_FAIL_S:
             return
         fails = int(db.get_meta(conn, key, "0") or 0) + 1
         db.set_meta(conn, key, str(fails))
         log.warning("pinned agent '%s': fast quiet turn on %s (%d/%d before unpin)",
-                    agent_name, mission_id, fails, FAIL_LIMIT)
-        if fails >= FAIL_LIMIT:
+                    agent_name, mission_id, fails, config.AGENT_FAIL_LIMIT)
+        if fails >= config.AGENT_FAIL_LIMIT:
             db.set_mission_pinned_agent(conn, mission_id, None)
             db.set_meta(conn, key, "0")
             db.log_event(conn, mission_id=mission_id, kind="agent_pin_dropped",
@@ -103,13 +99,13 @@ def record_turn_result(conn: sqlite3.Connection, mission_id: str,
         db.set_meta(conn, META_LAST_GOOD, agent_name)
         db.set_meta(conn, META_FAILS, "0")
         return
-    if ended_ts - started_ts >= FAST_FAIL_S:
+    if ended_ts - started_ts >= config.AGENT_FAST_FAIL_S:
         return  # long quiet turn - could be legitimate silent work; neutral
     fails = int(db.get_meta(conn, META_FAILS, "0") or 0) + 1
     db.set_meta(conn, META_FAILS, str(fails))
     log.warning("agent '%s': fast quiet turn on %s (%d/%d before fallback)",
-                agent_name, mission_id, fails, FAIL_LIMIT)
-    if fails < FAIL_LIMIT:
+                agent_name, mission_id, fails, config.AGENT_FAIL_LIMIT)
+    if fails < config.AGENT_FAIL_LIMIT:
         return
     last_good = db.get_meta(conn, META_LAST_GOOD)
     if not last_good or agents.canonical(last_good) == agent_name:

@@ -343,6 +343,58 @@ def h_mission_set_call_name(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "call_name": name}
 
 
+def h_config_list(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """All settings: current value (secrets masked), default, description."""
+    out = {}
+    for key, (env, typ, default, attr, desc) in config.SETTINGS.items():
+        raw = os.environ.get(env, "")
+        cur = raw if raw != "" else default
+        if typ == "secret" and cur:
+            cur = cur[:4] + "…" + cur[-2:] if len(cur) > 8 else "•••"
+        out[key] = {"value": cur, "default": default, "type": typ,
+                    "env": env, "description": desc,
+                    "modified": raw != "" and raw != default}
+    return out
+
+
+def h_config_set(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
+    """Set a config key: validates type, persists to the env file, updates the
+    live process env, and rebinds the config module attr so tunables apply
+    WITHOUT a restart. Empty value resets to default."""
+    key, = _require(p, "key")
+    key = str(key).strip().lower()
+    if key not in config.SETTINGS:
+        near = ", ".join(sorted(config.SETTINGS))
+        raise RPCError("bad_key", f"unknown setting {key!r}. known: {near}")
+    env, typ, default, attr, _desc = config.SETTINGS[key]
+    raw = str(p.get("value") if p.get("value") is not None else "").strip()
+    if raw == "":
+        raw = default
+    if typ == "int":
+        try:
+            typed: Any = int(raw)
+        except ValueError:
+            raise RPCError("bad_value", f"{key} expects an integer")
+    elif typ == "float":
+        try:
+            typed = float(raw)
+        except ValueError:
+            raise RPCError("bad_value", f"{key} expects a number")
+    else:
+        typed = raw
+    path = config.update_env_file(env, raw)
+    os.environ[env] = raw
+    if attr:
+        setattr(config, attr, typed)
+    if key == "agent":
+        from . import agents
+        agents.reset()
+    log.info("config: %s=%s (persisted to %s)", key,
+             "•••" if typ == "secret" else raw, path)
+    return {"ok": True, "key": key, "value": "•••" if typ == "secret" else raw,
+            "persisted_to": path, "live": bool(attr) or typ == "secret" or attr is None}
+
+
 def h_agent_get(d: Daemon, p: dict[str, Any]) -> dict[str, Any]:
     """Active agent backend, last-known-good, and per-backend availability."""
     from . import agent_switch
@@ -1251,6 +1303,8 @@ _HANDLERS: dict[str, Handler] = {
     "agent.get": h_agent_get,
     "agent.set": h_agent_set,
     "mission.set_agent": h_mission_set_agent,
+    "config.list": h_config_list,
+    "config.set": h_config_set,
     "mission.hold": h_mission_hold,
     "host.message": h_host_message,
     "host.inbox": h_host_inbox,

@@ -172,6 +172,64 @@ def ctl_agent_set(name: str, force: bool) -> None:
     click.echo(res["note"])
 
 
+@ctl_cli.group("config")
+def ctl_config() -> None:
+    """View or change orch settings - live, no restart needed."""
+
+
+@ctl_config.command("list")
+@click.option("--all", "show_all", is_flag=True, help="include unmodified settings")
+def ctl_config_list(show_all: bool) -> None:
+    """All settings with current values (secrets masked). Modified ones marked *."""
+    with client.DaemonClient() as c:
+        st = c.call("config.list", {})
+    width = max(len(k) for k in st)
+    for key, s in st.items():
+        mark = "*" if s["modified"] else " "
+        click.echo(f"{mark} {key:<{width}}  = {s['value']:<24}  {s['description']}")
+    click.echo("\n(* = changed from default; set with `orchctl config set <key> <value>`)")
+
+
+@ctl_config.command("get")
+@click.argument("key")
+def ctl_config_get(key: str) -> None:
+    with client.DaemonClient() as c:
+        st = c.call("config.list", {})
+    s = st.get(key.lower())
+    if not s:
+        click.echo(f"unknown key {key!r}", err=True)
+        sys.exit(1)
+    click.echo(f"{key} = {s['value']}   (default {s['default']}, env {s['env']})")
+    click.echo(s["description"])
+
+
+@ctl_config.command("set")
+@click.argument("key")
+@click.argument("value")
+def ctl_config_set(key: str, value: str) -> None:
+    """Set a value - validated, persisted, applied to the running daemon."""
+    try:
+        with client.DaemonClient() as c:
+            res = c.call("config.set", {"key": key, "value": value})
+    except client.DaemonError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"{res['key']} = {res['value']}  (saved to {res['persisted_to']}, live now)")
+
+
+@ctl_config.command("reset")
+@click.argument("key")
+def ctl_config_reset(key: str) -> None:
+    """Reset a key back to its default."""
+    try:
+        with client.DaemonClient() as c:
+            res = c.call("config.set", {"key": key, "value": ""})
+    except client.DaemonError as e:
+        click.echo(f"error: {e}", err=True)
+        sys.exit(1)
+    click.echo(f"{res['key']} reset to default: {res['value']}")
+
+
 @ctl_agent.command("pin")
 @click.argument("mission_id")
 @click.argument("name")

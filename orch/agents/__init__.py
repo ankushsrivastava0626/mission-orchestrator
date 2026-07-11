@@ -17,7 +17,7 @@ import os
 
 from .base import Adapter
 
-AGENT_NAMES = ("claude", "codex", "antigravity", "gemini", "api", "custom")
+AGENT_NAMES = ("claude", "codex", "antigravity", "opencode", "gemini", "api", "custom")
 
 _ADAPTER: Adapter | None = None
 
@@ -41,6 +41,9 @@ def make_adapter(name: str) -> Adapter:
     if n == "antigravity":
         from .antigravity import AntigravityAdapter
         return AntigravityAdapter()
+    if n == "opencode":
+        from .opencode import OpenCodeAdapter
+        return OpenCodeAdapter()
     if n == "gemini":
         from .gemini import GeminiAdapter
         return GeminiAdapter()

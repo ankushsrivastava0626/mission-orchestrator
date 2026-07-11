@@ -16,12 +16,10 @@ import os
 import sqlite3
 import time
 
-from . import db
+from . import config, db
 
 log = logging.getLogger(__name__)
 
-TRANSCRIPT_TAIL_CHARS = 6000
-HANDOFF_CAP_CHARS = 9000
 HANDOFF_DIR = os.path.expanduser("~/.orch/handoff")
 
 
@@ -55,7 +53,7 @@ def _tail_claude(mission_id: str) -> str:
                 parts.append(f"[{role}] {t}")
     except OSError:
         return ""
-    return "\n".join(parts)[-TRANSCRIPT_TAIL_CHARS:]
+    return "\n".join(parts)[-config.HANDOFF_TAIL_CHARS:]
 
 
 def _tail_api(mission_id: str) -> str:
@@ -77,7 +75,7 @@ def _tail_api(mission_id: str) -> str:
                           if isinstance(b, dict) and b.get("type") == "text")
         if isinstance(c, str) and c.strip() and role in ("user", "assistant"):
             parts.append(f"[{role}] {c.strip()}")
-    return "\n".join(parts)[-TRANSCRIPT_TAIL_CHARS:]
+    return "\n".join(parts)[-config.HANDOFF_TAIL_CHARS:]
 
 
 def _transcript_tail(mission_id: str, old_agent: str) -> str:
@@ -123,7 +121,7 @@ def build_handoff(conn: sqlite3.Connection, mission_id: str,
     if tail:
         lines.append("\n--- tail of the previous agent's conversation ---")
         lines.append(tail)
-    doc = "\n".join(lines)[:HANDOFF_CAP_CHARS]
+    doc = "\n".join(lines)[:config.HANDOFF_CAP_CHARS]
     try:
         os.makedirs(HANDOFF_DIR, exist_ok=True)
         with open(os.path.join(HANDOFF_DIR, f"{mission_id}-{int(time.time())}.md"), "w") as fh:
