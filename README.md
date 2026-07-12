@@ -1,118 +1,219 @@
-# orch - mission orchestrator for AI agents
+<div align="center">
 
-Delegate long-running, stateful jobs ("missions") to AI worker agents that run
-unattended on your machine - each in its own tmux session with persistent
-memory - and control the whole fleet from Telegram: every mission gets its own
-chat topic, agents message you, you message them back, they phone you (voice
-extra) when something truly needs you.
+# 🛰️ orch
 
-Works with **any coding agent**:
+### Your always on AI ops team, living in tmux and answering on Telegram
 
-| backend  | runs on                              | resume | compact | notes |
-|----------|--------------------------------------|--------|---------|-------|
-| `claude` | Claude Code CLI                      | ✓      | ✓       | richest support (default) |
-| `codex`  | OpenAI Codex CLI                     | ✓      | ✓       | per-mission CODEX_HOME isolation |
-| `antigravity` | Google Antigravity (`agy`)      | ✓      | -       | tools via the `oworker` shell bridge |
-| `opencode` | OpenCode (open source)             | ✓      | -       | any model via `-m provider/model` (OpenRouter, local, …) |
-| `gemini` | Gemini CLI                           | ✓      | -       | per-mission workdir isolation |
-| `api`    | **no CLI - just an API key**         | ✓      | ✓       | Anthropic or any OpenAI-compatible endpoint (OpenAI, OpenRouter, Ollama, …) |
-| `custom` | any agent CLI via command templates  | you    | -       | plug in anything |
+Delegate long running, stateful work to AI agents that run unattended on your own machine, keep their memory across days, and message you the moment they need you. One Telegram bot commands the whole fleet. Swap the brain behind any worker between Claude, Codex, Antigravity, OpenCode, or any model on OpenRouter, without losing the thread.
 
-**Switch backends live** - `orchctl agent set gemini` (or `/agent gemini` in
-Telegram, or the `agent.set` host-MCP tool). The switch persists, and each
-running mission *migrates on its next wake*: it starts a fresh session on the
-new agent seeded with an auto-generated handoff (mission state, step history,
-active watchers, and a tail of the old conversation) - no work lost, no tokens
-spent building it. `orchctl agent show` lists what's usable on the machine.
-**Sticky by default:** whatever agent/model you set STAYS set - orch never
-switches behind your back; a broken backend fails loudly in the logs instead.
-Optional safety net: `orchctl config set agent_auto_fallback on` lets orch
-auto-revert to the last working backend (and unpin dead pinned ones) after
-repeated dead turns.
+![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)
+![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS-lightgrey)
+![Agents](https://img.shields.io/badge/agent%20backends-7-brightgreen)
+![Control](https://img.shields.io/badge/control-Telegram-26A5E4?logo=telegram&logoColor=white)
+![License](https://img.shields.io/badge/license-MIT-green)
 
-**Per-mission override** - pin a single mission to a different backend while
-everything else stays on the global one: the 🤖 button on the mission's
-Telegram card, or `orchctl agent pin <mission> <backend>` (`-` clears the
-pin), or the `mission.set_agent` RPC. Pinned missions migrate with the same
-handoff mechanism; if a pinned backend dies, the mission auto-unpins back to
-the global agent rather than stalling.
+</div>
 
-## Install
+---
 
-```bash
-git clone <this repo> orch && cd orch
-./install.sh          # checks deps, installs CLIs, runs the setup wizard
+## The idea in one breath
+
+You have work that does not fit in a single chat: watch a site for a week, run a daily routine, chase a deadline, babysit a long build, keep a project moving while you sleep. A normal AI chat forgets everything when you close the tab. **orch** turns each of those jobs into a **mission**: a persistent AI worker that lives in its own tmux session, remembers everything, wakes itself on a schedule, watches for conditions without burning tokens, and talks to you on Telegram like a colleague. When something truly needs you, it can even call your phone.
+
+```
+You (Telegram)  ->  one bot, one topic per mission  ->  a fleet of AI workers on your box
+     ^                                                             |
+     |__________ they notify, send files, and phone you  <_________|
 ```
 
-Requirements: Linux or macOS (Windows → WSL), Python ≥ 3.11, `tmux`.
-Optional: `pass`+GPG (secrets vault), systemd (run-at-boot service).
+You stay in the loop from your pocket. The work happens on your machine, on your terms, with your keys.
 
-The wizard (`orchd setup`, also auto-offered on first `orchd start`) asks for:
-your agent backend, a Telegram bot token (it auto-detects your chat id when
-you message the bot), an optional Topics group, and a vault passphrase - then
-writes `~/.orch/orchd.env` and can install the systemd service.
+---
 
-## Concepts (90 seconds)
+## Why people keep it running
 
-- **Mission** - one persistent worker-agent session in one tmux. Survives
-  reboots; resumes with full context on every wake.
-- **Step** - a directive in the mission's linear queue, gated by a **cue**:
-  `immediate`, `on_current_complete` (jump the queue), `on_timeout`,
-  `at_time` (absolute wall-clock - workers self-schedule future work).
-- **Heartbeat** - periodic "report status to the user" nudge (default daily).
-- **Scripted ping** - the worker writes+tests a tiny watcher script that polls
-  some condition with **zero tokens** and only wakes the agent when it fires
-  (a watchdog re-tasks the worker if the script dies).
-- **Auto-compaction** - when an idle worker's context crosses 200k tokens the
-  daemon compacts the session so future wakes stay cheap.
-- **Vault** - per-mission secrets in `pass`; workers read them with `msec`.
+- 🧠 **Missions that never forget.** Each mission is one long lived agent session in its own tmux. It survives reboots and resumes with full context on every wake.
+- 📱 **Run the whole fleet from Telegram.** One bot. Every mission gets its own chat topic. Type in a topic and it goes straight to that worker. Its reply comes back in the same thread. Creating a topic creates a mission.
+- 🔀 **Any agent, swappable live.** Claude Code, Codex, Antigravity, OpenCode, Gemini, a raw API key, or any custom CLI. Switch the brain of a running worker with one command and it migrates without losing the thread.
+- 🌍 **Any model on the planet.** Point OpenCode at an OpenRouter key and pick from hundreds of models per mission, including free ones. Or run fully local through Ollama.
+- ⏰ **They schedule themselves.** A worker can queue its own future work: "call me at 9am", "retry in 30 minutes", "follow up tomorrow".
+- 👀 **Watchers that cost zero tokens.** Instead of polling, a worker writes a tiny script that sleeps until a condition fires, then wakes the agent only when it matters.
+- ☎️ **Escalation by real phone call.** When a text is not enough, a worker rings your actual phone through a voice agent, reads its own context, asks the question, and relays your spoken answer back as a new instruction.
+- 🗜️ **Cost control on autopilot.** When a session grows past a token threshold, orch compacts it so future wakes stay cheap. Live token sizes are one command away.
+- 🔒 **Your box, your keys.** Everything runs on your machine. Secrets live in an encrypted per mission vault.
 
-## Telegram control
+---
 
-One @BotFather bot gives you:
+## Pick your brain
 
-- `/create <name>`, `/missions`, `/m <id>`, `/context` (live token sizes),
-  `/pane`, `/events`, cancel/delete - all with inline-keyboard menus.
-- **Topics mode**: point orch at a forum supergroup and every mission gets its
-  own topic. Messages you type in a topic go straight to that worker; its
-  replies come back in-thread. **Creating a topic creates a mission.**
-- Attachments both ways (images inline, any file type), typing indicators,
-  reply coalescing (rapid messages within 5 s arrive as one directive),
-  per-mission "calling name", live-location capture for `get_user_location`.
+Every worker is powered by an **agent backend**. Choose one globally, or pin a different one to a single mission. Switching is live and the mission carries its memory over through an automatic handoff.
 
-## Host control (drive it from another AI)
+| Backend       | Runs on                                   | Resume | Compact | Notes |
+|---------------|-------------------------------------------|:------:|:-------:|-------|
+| `claude`      | Claude Code CLI                           |   ✅   |   ✅    | The reference backend, richest support |
+| `codex`       | OpenAI Codex CLI                          |   ✅   |   ✅    | Isolated session store per mission |
+| `antigravity` | Google Antigravity (`agy`)                |   ✅   |   ♻️    | Tools bridged through a shell toolkit |
+| `opencode`    | OpenCode, open source                     |   ✅   |   ♻️    | **Any model** via `provider/model`, OpenRouter or local |
+| `gemini`      | Gemini CLI                                |   ✅   |   ♻️    | Per mission workdir isolation |
+| `api`         | **No CLI, just an API key**               |   ✅   |   ✅    | Anthropic, OpenAI, OpenRouter, Ollama, vLLM |
+| `custom`      | Any agent CLI via two command templates   |   ✅   |   ♻️    | Plug in anything |
 
-Any MCP-capable assistant can be the "host" that creates missions and reads
-the worker→host mailbox. Point it at `orch-mcp --mode host` (see
-`host-mcp-config.json`; works over SSH for remote control). Workers get their
-own scoped MCP surface automatically: `notify`, `send_file`, `talk_to_user`
-(voice extra), `message_host`, `queue.*`, `pings.*`, `heartbeat.*`,
-`get_user_location`, `mission.status`.
+✅ native   ♻️ rebuild compaction (fresh session seeded with a handoff summary)
 
-## CLIs
+> **Sticky by design.** Whatever you set stays set. orch never swaps a backend behind your back. Turn on `agent_auto_fallback` if you want it to self heal to the last working agent after repeated dead turns.
 
-| command   | what |
-|-----------|------|
-| `orchd`   | the daemon (`setup`, `start`, `status`) |
-| `orchctl` | admin from the shell (create, step-add, cancel, …) |
-| `orch-mcp`| MCP server, host mode & worker mode |
-| `owatch`  | scripted-ping heartbeat/fire/ready (used by watcher scripts) |
-| `msec`    | worker-side secret/cookie reader |
-| `oworker` | worker toolkit as shell commands (for MCP-less backends) |
+---
+
+## Quick start
+
+```bash
+git clone https://github.com/ankushsrivastava0626/mission-orchestrator orch
+cd orch
+./install.sh
+```
+
+The installer checks your dependencies, installs the CLIs, and launches an interactive setup wizard that:
+
+1. asks which agent backend runs your workers,
+2. takes a Telegram bot token from [@BotFather](https://t.me/BotFather) and **auto detects your chat id** the moment you message the bot,
+3. optionally wires a Telegram group so each mission gets its own topic,
+4. writes `~/.orch/orchd.env` and can install a systemd service so it survives reboots.
+
+Then just message your bot:
+
+```
+/create watch-my-deploy
+```
+
+and start talking to it. That is it.
+
+**Requirements:** Linux or macOS (Windows via WSL), Python 3.11 or newer, and `tmux`. Optional: `pass` and GnuPG for the secrets vault, and systemd for run at boot.
+
+---
+
+## How it fits together
+
+```mermaid
+flowchart TD
+    U["📱 You on Telegram"] <--> BOT["Command bot"]
+    BOT <--> D["orchd daemon<br/>scheduler + cue engine + RPC"]
+    D --> M1["Mission: watch-deploy<br/>tmux + worker agent"]
+    D --> M2["Mission: daily-report<br/>tmux + worker agent"]
+    D --> M3["Mission: research<br/>tmux + worker agent"]
+    M1 -. "notify / send file / phone" .-> D
+    M2 -. "queue future work" .-> D
+    M3 -. "zero token watcher fires" .-> D
+    D -->|"per mission topic"| BOT
+
+    subgraph ADP["Swappable brains"]
+      A1["claude"]:::a
+      A2["codex"]:::a
+      A3["antigravity"]:::a
+      A4["opencode + any model"]:::a
+      A5["api / custom"]:::a
+    end
+    M1 --- ADP
+    classDef a fill:#0d1117,stroke:#30363d,color:#c9d1d9;
+```
+
+The **daemon** owns a small SQLite database and a Unix socket. It schedules work, watches for conditions, and speaks to Telegram. Each **mission** is a worker agent in a tmux session that keeps its full memory and talks back through a scoped tool surface. The **agent adapter layer** means the core never assumes a specific CLI, so new backends drop in as a single file.
+
+---
+
+## Core concepts
+
+| Concept            | What it is |
+|--------------------|-----------|
+| **Mission**        | One persistent worker session in one tmux. Survives reboots, resumes with full context. |
+| **Step**           | A directive in the mission's linear queue, gated by a **cue**. |
+| **Cue**            | When a step fires: `immediate`, `on_current_complete` (jump the queue), `on_timeout`, or `at_time` (an absolute wall clock time, so workers can plan the future). |
+| **Heartbeat**      | A periodic "report your status" nudge. Daily by default. |
+| **Scripted ping**  | A watcher script the worker writes and tests once. It polls a condition on its own for zero tokens and wakes the agent only when it fires. A watchdog re tasks the worker if the script dies. |
+| **Auto compaction**| When an idle worker crosses a token threshold, orch compacts the session so future wakes stay cheap. |
+| **Vault**          | Per mission secrets in `pass` and GnuPG. Workers read them with `msec`. Values never travel through tool responses. |
+
+---
+
+## Telegram is the whole cockpit
+
+One bot from BotFather gives you:
+
+- **Commands with menus:** `/missions`, `/m <id>`, `/create <name>`, `/context` (live token sizes across every mission), `/agent` (view or switch the backend), `/pane`, `/events`, plus inline keyboards for every action.
+- **Topics mode:** point orch at a forum group and every mission gets its own topic. Talk in a topic to reach that worker. Its replies come back in thread. **Create a topic and orch spins up a mission bound to it.**
+- **Per mission model picker:** choose `opencode` on a mission and pick the model from recently used buttons or type any OpenRouter id like `tencent/hy3:free`.
+- **Attachments both ways:** send an image or any file to a worker, or receive one back. Images preview inline.
+- **Human touches:** typing indicators, rapid messages coalesced into one, a per mission calling name for phone calls, and live location capture.
+
+---
+
+## The command line
+
+| Command   | What it does |
+|-----------|--------------|
+| `orchd`   | The daemon. `orchd setup`, `orchd start`, `orchd status`. |
+| `orchctl` | Admin from the shell. Create missions, add steps, switch or pin agents, and change any setting live. |
+| `orch-mcp`| The MCP server, in host mode or worker mode. |
+| `owatch`  | Heartbeat, fire, and ready calls used by scripted watcher scripts. |
+| `msec`    | Worker side secret and cookie reader. |
+| `oworker` | The full worker toolkit as plain shell commands, for backends without native MCP. |
+
+A few favorites:
+
+```bash
+orchctl agent show                 # what backends are usable on this machine
+orchctl agent set opencode         # switch the global brain, live
+orchctl agent pin research codex   # pin one mission to a different backend
+orchctl config set auto_compact_threshold 150000   # tune anything, no restart
+orchctl config list                # every setting, current value, and default
+```
+
+---
+
+## Drive it from another AI
+
+Any MCP capable assistant can be the **host** that creates missions and reads a worker to host mailbox, even over SSH. Workers get their own scoped tool surface automatically:
+
+`notify` `send_file` `talk_to_user` `message_host` `queue.*` `pings.*` `heartbeat.*` `get_user_location` `mission.status`
+
+This is how one Claude can quietly run a team of other agents on a remote box and check in on them whenever you ask.
+
+---
 
 ## Extras
 
-- **`extras/jami-voice/`** - J-dawg: real ringing voice calls over Jami when a
-  worker needs a decision; reads the mission's context, relays your spoken
-  answer back as a new step. See its README.
+### ☎️ Voice escalation (`extras/jami-voice/`)
 
-## Files & dirs
+When a text will not do, a worker places a real ringing call to your phone over [Jami](https://jami.net), a peer to peer network that needs no phone number. The voice agent reads the mission's context, asks the question in its own voice, and relays your spoken answer back to the worker as a new step. Full reference implementation included, from the audio routing to the escalation protocol.
 
-`~/.orch/` - db, socket, config (`orchd.env`), mailbox, incoming files,
-api-backend sessions, compact logs. Worker scratch: `/tmp/orch-<mission>/`.
+---
+
+## Configuration at a glance
+
+Everything lives in one env file (`~/.orch/orchd.env`) and every tunable is changeable live with `orchctl config set`:
+
+- auto compaction threshold, check interval, and cooldown
+- rapid message coalescing window
+- heartbeat defaults and limits
+- agent health and fallback behavior
+- handoff document sizing
+- all backend binaries, keys, and Telegram wiring
+
+---
 
 ## Security notes
 
-Workers run with full permissions on this machine by design - they are *your*
-agents doing real work. Isolation between missions is logical (scoped tools,
-separate sessions/topics), not an OS sandbox. Don't run untrusted directives.
+Workers run with full access on your machine by design. They are your agents doing real work with your tools. Isolation between missions is logical, through scoped tools and separate sessions and topics, not an operating system sandbox. Do not run untrusted directives, and keep the box you trust the box that runs orch.
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE). Built to be forked, extended, and made your own.
+
+<div align="center">
+
+**Built for people who want an AI team that keeps working after they close the laptop.**
+
+If this is useful, a ⭐ helps other builders find it.
+
+</div>
