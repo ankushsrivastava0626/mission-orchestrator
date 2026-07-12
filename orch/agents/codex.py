@@ -136,11 +136,13 @@ class CodexAdapter(Adapter):
         logf = open(os.path.expanduser(f"~/.orch/compact-{mission_id}.log"), "ab")
         logf.write(f"\n=== codex compact start mid={mission_id} ===\n".encode())
         logf.flush()
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [CODEX_BIN, "exec", "resume", "--last", "--yolo",
              "--skip-git-repo-check", "/compact"],
             stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
             start_new_session=True, cwd="/",
             env={**os.environ, "CODEX_HOME": str(home)},
         )
+        from .claude_code import _write_compact_pid
+        _write_compact_pid(mission_id, proc.pid)
         return True

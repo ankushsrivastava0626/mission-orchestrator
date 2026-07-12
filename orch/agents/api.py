@@ -76,12 +76,14 @@ class ApiAdapter(Adapter):
 
     def compact(self, mission_id: str) -> bool:
         logf = open(os.path.expanduser(f"~/.orch/compact-{mission_id}.log"), "ab")
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [sys.executable, "-m", "orch.agents.api_worker",
              "--mission-id", mission_id, "--compact"],
             stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
             start_new_session=True,
         )
+        from .claude_code import _write_compact_pid
+        _write_compact_pid(mission_id, proc.pid)
         return True
 
     def cleanup(self, mission_id: str) -> None:

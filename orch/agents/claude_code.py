@@ -80,7 +80,7 @@ class ClaudeCodeAdapter(Adapter):
         logf = open(logpath, "ab")
         logf.write(f"\n=== compact start mid={mission_id} ===\n".encode())
         logf.flush()
-        subprocess.Popen(
+        proc = subprocess.Popen(
             [_claude_abs(), "--resume", mission_id,
              "--dangerously-skip-permissions", "--verbose", "-p", "/compact"],
             stdin=subprocess.DEVNULL, stdout=logf, stderr=subprocess.STDOUT,
@@ -89,7 +89,18 @@ class ClaudeCodeAdapter(Adapter):
                  "PATH": os.environ.get("PATH", "") + ":" + os.path.expanduser("~/.local/bin"),
                  "IS_SANDBOX": "1"},
         )
+        _write_compact_pid(mission_id, proc.pid)
         return True
+
+
+def _write_compact_pid(mission_id: str, pid: int) -> None:
+    """Busy-detection reads this so a detached compact counts as a running
+    turn (it IS a session resume - nothing else may touch the session)."""
+    try:
+        with open(os.path.expanduser(f"~/.orch/compact-{mission_id}.pid"), "w") as fh:
+            fh.write(str(pid))
+    except OSError:
+        pass
 
 
 def _jsonl_context_tokens(path: str) -> tuple[int, int]:

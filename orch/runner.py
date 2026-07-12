@@ -206,33 +206,62 @@ def launch_oob(mission_id: str, directive: str) -> None:
     launch_step(mission_id, directive, first_step=False)
 
 
+def _pane_children(pane_pid: int) -> list[int]:
+    """All descendant PIDs of the tmux pane's shell (one /proc pass)."""
+    import glob
+    ppid_map: dict[int, list[int]] = {}
+    for stat in glob.glob("/proc/[0-9]*/stat"):
+        try:
+            parts = open(stat).read().rsplit(") ", 1)[1].split()
+            pid = int(stat.split("/")[2])
+            ppid = int(parts[1])
+            ppid_map.setdefault(ppid, []).append(pid)
+        except (OSError, IndexError, ValueError):
+            continue
+    out: list[int] = []
+    stack = [pane_pid]
+    while stack:
+        for child in ppid_map.get(stack.pop(), []):
+            out.append(child)
+            stack.append(child)
+    return out
+
+
 def step_running(mission_id: str) -> bool:
     """Is a worker-agent process for this mission currently running?
 
-    Uses pgrep against the full command line so the answer survives a human
-    attaching to the tmux pane and running other commands (which would fool
-    a foreground-command check). Every adapter guarantees the mission id
-    appears on its worker's command line; the adapter validates the hit so a
-    process that merely *mentions* the id (e.g. a grep) doesn't false-match.
+    Primary signal (backend-agnostic): the mission's tmux pane shell has ANY
+    child process - i.e. a foreground job is running. This works for every
+    adapter because env-var-carried mission ids vanish from process cmdlines
+    after exec, so string matching alone misses codex/opencode/agy workers.
+
+    Secondary signals: a legacy cmdline match (claude puts the id in argv),
+    and a live detached compaction process (pidfile written by adapters) -
+    a compact IS a session resume and must count as busy.
     """
+    session = config.tmux_session_name(mission_id)
+    if tmux_session_exists(session):
+        pane_pid = tmux_pane_pid(session)
+        if pane_pid and _pane_children(pane_pid):
+            return True
+    # Detached compaction in flight?
+    import os as _os
+    pidfile = _os.path.expanduser(f"~/.orch/compact-{mission_id}.pid")
+    try:
+        pid = int(open(pidfile).read().strip())
+        _os.kill(pid, 0)
+        return True
+    except (OSError, ValueError):
+        pass
+    # Legacy cmdline match (claude-style argv ids).
     from . import agents
     try:
-        res = subprocess.run(
-            ["pgrep", "-af", mission_id],
-            capture_output=True,
-        )
+        res = subprocess.run(["pgrep", "-af", mission_id], capture_output=True)
     except FileNotFoundError:
         return False
     for line in res.stdout.decode("utf-8", "replace").splitlines():
-        # Ignore our own pgrep and shell wrappers quoting the id.
         if "pgrep" in line:
             continue
-        # Missions can be pinned to a non-global backend, so match against
-        # every backend's process signature, not just the active adapter's.
         if agents.any_worker_line(line, mission_id):
             return True
     return False
-
-
-# Session-size and compaction logic lives in each agent adapter
-# (orch/agents/*) - the backend owns its transcript format.
