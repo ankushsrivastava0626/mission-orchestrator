@@ -17,6 +17,18 @@ from .. import config
 
 CODEX_BIN = os.environ.get("ORCH_CODEX_BIN", "codex")
 
+# Codex (since the server-side "code mode" rollout) hides MCP tools in a
+# DEFERRED tool catalog under names like `mcp__orch__notify` - models often
+# fail to find them and end turns silently. Every directive gets this hint.
+TOOL_NOTE = """\
+[TOOL NOTE] Your orch tools are MCP tools that may be DEFERRED: if `notify` /
+`orch` tools aren't directly visible, search your deferred tool catalog for
+`mcp__orch__*` (e.g. `mcp__orch__notify`) and load/call them from there.
+The user ONLY sees messages you send via the orch notify tool - always send
+your reply/result through it before ending your turn.
+
+"""
+
 
 class CodexAdapter(Adapter):
     name = "codex"
@@ -78,7 +90,7 @@ class CodexAdapter(Adapter):
         return (
             f"env CODEX_HOME={self.q(str(home))} ORCH_MISSION_ID={mission_id}"
             f" {CODEX_BIN} {sub} --yolo"
-            f" --skip-git-repo-check {self.q(directive)}"
+            f" --skip-git-repo-check {self.q(TOOL_NOTE + directive)}"
         )
 
     def is_running_line(self, line: str, mission_id: str) -> bool:
