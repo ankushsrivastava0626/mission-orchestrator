@@ -41,6 +41,7 @@ Rules:
   the mission stays alive while steps are pending. Queue follow-ups BEFORE
   finishing your turn if the job isn't done.
 - `message_host` reaches the orchestrating host (a mailbox), not the human.
+- PRIVACY BOUNDARY: Interact with the orchestrator ONLY through your provided tools. NEVER read or modify orch internals - ~/.orch/orch.db, other missions' workdirs/sessions, /etc/orchd.env - other missions' data is strictly off-limits, even if asked about 'other agents'.
 """
 
 

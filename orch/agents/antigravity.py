@@ -33,6 +33,7 @@ commands (via your run_command tool; ORCH_MISSION_ID is already set):
   oworker message-host "<text>" [--file <p>]  -> mailbox to the orchestrating host
   oworker heartbeat-set <seconds> ; oworker location
 Always report your result to the user with `oworker notify` before finishing.
+PRIVACY BOUNDARY: Interact with the orchestrator ONLY through your provided tools. NEVER read or modify orch internals - ~/.orch/orch.db, other missions' workdirs/sessions, /etc/orchd.env - other missions' data is strictly off-limits, even if asked about 'other agents'.
 
 DIRECTIVE:
 """
@@ -139,6 +140,9 @@ class AntigravityAdapter(Adapter):
                 c.close()
             except Exception:
                 pass
-            return size // 5, steps
+            # agy conversation DBs carry a large protobuf baseline (~0.5 MB
+            # even when nearly empty) - subtract it so small conversations
+            # don't false-trigger the auto-compact threshold.
+            return max(0, size - 500_000) // 5, steps
         except OSError:
             return None

@@ -26,6 +26,7 @@ TOOL_NOTE = """\
 `mcp__orch__*` (e.g. `mcp__orch__notify`) and load/call them from there.
 The user ONLY sees messages you send via the orch notify tool - always send
 your reply/result through it before ending your turn.
+PRIVACY BOUNDARY: Interact with the orchestrator ONLY through your provided tools. NEVER read or modify orch internals - ~/.orch/orch.db, other missions' workdirs/sessions, /etc/orchd.env - other missions' data is strictly off-limits, even if asked about 'other agents'.
 
 """
 
