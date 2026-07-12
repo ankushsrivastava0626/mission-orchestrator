@@ -27,9 +27,12 @@ class Engine:
         # Per-mission timestamp of the last (throttled) context-size check for
         # auto-compaction.
         self._last_ctx_check: dict[str, int] = {}
-        # In-flight worker turns: mission_id -> (launch_ts, agent_name). Used
-        # to grade each turn (worked / dead) for last-good fallback.
-        self._turn_started: dict[str, tuple[int, str]] = {}
+        # In-flight worker turns: mission_id -> (launch_ts, agent_name, kind).
+        # Used to grade each turn (worked / dead) and to catch user-reply
+        # turns that ended without any notify (silent turns).
+        self._turn_started: dict[str, tuple[int, str, str]] = {}
+        # Missions already nudged once for a silent reply (one retry only).
+        self._silent_nudged: set[str] = set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -89,14 +92,39 @@ class Engine:
         if (inflight is not None and running is None and not claude_busy
                 and now - inflight[0] >= 5):
             self._turn_started.pop(mission_id, None)
+            started_ts, agent_name, turn_kind = inflight
             try:
                 from . import agent_switch
                 agent_switch.record_turn_result(
-                    self.conn, mission_id, inflight[1],
-                    started_ts=inflight[0], ended_ts=now,
+                    self.conn, mission_id, agent_name,
+                    started_ts=started_ts, ended_ts=now,
                 )
             except Exception:
                 log.exception("turn grading failed for %s", mission_id)
+            # Silent-reply guard: a user_reply turn that never notified the
+            # user reads as "the agent stopped responding". Nudge ONCE.
+            if turn_kind == "user_reply":
+                replied = self.conn.execute(
+                    "SELECT 1 FROM events WHERE mission_id = ? AND ts >= ?"
+                    " AND kind IN ('notify_sent','notify_file_sent') LIMIT 1",
+                    (mission_id, started_ts),
+                ).fetchone()
+                if replied is None and mission_id not in self._silent_nudged:
+                    self._silent_nudged.add(mission_id)
+                    log.warning("mission %s: user_reply turn ended silent - nudging", mission_id)
+                    self._enqueue_oob(mission_id, {
+                        "kind": "silent_retry",
+                        "directive": (
+                            "Your previous turn ended WITHOUT sending anything to "
+                            "the user - they can only see messages you send via "
+                            "the `notify` tool (or `oworker notify`), so from "
+                            "their side you went silent. Compose your reply to "
+                            "their last message and send it via notify NOW."),
+                    })
+                    db.log_event(self.conn, mission_id=mission_id,
+                                 kind="silent_reply_nudged")
+                elif replied is not None:
+                    self._silent_nudged.discard(mission_id)
 
         # 2. If any OOB queued and claude is idle, fire one now.
         if running is None and not claude_busy and self._pending_oob.get(mission_id):
@@ -258,8 +286,9 @@ class Engine:
             first = not hs
         return directive, first, adapter
 
-    def _mark_launched(self, mission_id: str, agent_name: str) -> None:
-        self._turn_started[mission_id] = (db.now_ts(), agent_name)
+    def _mark_launched(self, mission_id: str, agent_name: str,
+                       kind: str = "step") -> None:
+        self._turn_started[mission_id] = (db.now_ts(), agent_name, kind)
 
     def _launch_oob(self, mission_id: str, payload: dict[str, Any]) -> None:
         try:
@@ -268,7 +297,7 @@ class Engine:
                 mission_id, payload["directive"], first)
             runner.launch_step(mission_id, directive, first_step=first,
                                adapter=adapter)
-            self._mark_launched(mission_id, adapter.name)
+            self._mark_launched(mission_id, adapter.name, payload["kind"])
             db.log_event(
                 self.conn,
                 mission_id=mission_id,
