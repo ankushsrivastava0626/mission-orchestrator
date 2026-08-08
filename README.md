@@ -14,6 +14,8 @@ Delegate long running, stateful work to AI agents that run unattended on your ow
 
 </div>
 
+> **Note:** This project lived in local development from May to July 2026 and was migrated to GitHub in August 2026. The full build timeline is preserved in the commit history.
+
 ---
 
 ## The idea in one breath
