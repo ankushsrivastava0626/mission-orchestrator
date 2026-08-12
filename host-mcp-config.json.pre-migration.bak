@@ -8,7 +8,7 @@
         "-o", "ServerAliveInterval=30",
         "-o", "ServerAliveCountMax=3",
         "-o", "ConnectTimeout=10",
-        "root@169.58.148.138",
+        "root@107.170.18.216",
         "/usr/local/bin/orch-mcp", "--mode", "host"
       ]
     }

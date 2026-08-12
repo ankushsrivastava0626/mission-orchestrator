@@ -1,0 +1,6 @@
+.git
+*.bundle
+__pycache__
+*.egg-info
+extras/jami-voice
+docker/cli-bundle/*.md

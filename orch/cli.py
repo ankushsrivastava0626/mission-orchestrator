@@ -474,3 +474,121 @@ def oworker_main() -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     daemon_main()
+
+
+# ---------- orch-fleet (Docker multi-instance manager) ----------
+
+
+@click.group()
+def fleet_cli() -> None:
+    """Run many isolated orch instances as Docker containers, one bot each."""
+
+
+@fleet_cli.command("build")
+@click.option("--image", default=None, help="image tag (default orch:latest)")
+def fleet_build(image: str | None) -> None:
+    """Build the orch container image (stages agent CLIs from this host)."""
+    import os as _os
+    import subprocess as _sp
+    from . import fleet as _f
+    here = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "docker", "build.sh")
+    env = {**_os.environ}
+    if image:
+        env["ORCH_IMAGE"] = image
+    sys.exit(_sp.run(["bash", here], env=env).returncode)
+
+
+@fleet_cli.command("create")
+@click.argument("name")
+@click.option("--bot-token", required=True, help="Telegram command bot token for this instance")
+@click.option("--chat-id", default=None, help="your Telegram chat id (allowlist + default)")
+@click.option("--agent", default=None, help="override the default agent backend for this instance")
+@click.option("--model", default=None, help="opencode model, e.g. openrouter/deepseek/deepseek-chat")
+@click.option("--topics-chat", default=None, help="forum supergroup id for per-mission topics")
+@click.option("--image", default="orch:latest")
+@click.option("--no-seed", is_flag=True, help="do not copy host agent logins into the instance")
+def fleet_create(name, bot_token, chat_id, agent, model, topics_chat, image, no_seed) -> None:
+    """Create and start a new isolated instance."""
+    from . import fleet as _f
+    try:
+        _f.create(name, bot_token=bot_token, chat_id=chat_id, agent=agent,
+                  model=model, topics_chat=topics_chat, image=image, no_seed=no_seed)
+    except _f.FleetError as e:
+        click.echo(f"error: {e}", err=True); sys.exit(1)
+
+
+@fleet_cli.command("list")
+def fleet_list() -> None:
+    """List all instances and their state."""
+    from . import fleet as _f
+    try:
+        rows = _f.ls()
+    except _f.FleetError as e:
+        click.echo(f"error: {e}", err=True); sys.exit(1)
+    if not rows:
+        click.echo("no instances yet. Create one: orch-fleet create <name> --bot-token <tok>")
+        return
+    for r in rows:
+        mark = {"running": "▶", "exited": "■", "restarting": "…"}.get(r["state"], "?")
+        line = f"{mark} {r['name']:<20} {r['state']:<11} {r['status']}"
+        if r["missions"]:
+            line += f"   [{r['missions']}]"
+        click.echo(line)
+
+
+@fleet_cli.command("start")
+@click.argument("name")
+def fleet_start(name) -> None:
+    from . import fleet as _f
+    try: _f.start(name)
+    except _f.FleetError as e: click.echo(f"error: {e}", err=True); sys.exit(1)
+
+
+@fleet_cli.command("stop")
+@click.argument("name")
+def fleet_stop(name) -> None:
+    from . import fleet as _f
+    try: _f.stop(name)
+    except _f.FleetError as e: click.echo(f"error: {e}", err=True); sys.exit(1)
+
+
+@fleet_cli.command("restart")
+@click.argument("name")
+def fleet_restart(name) -> None:
+    from . import fleet as _f
+    try: _f.restart(name)
+    except _f.FleetError as e: click.echo(f"error: {e}", err=True); sys.exit(1)
+
+
+@fleet_cli.command("rm")
+@click.argument("name")
+@click.option("--purge", is_flag=True, help="also delete the volume (ALL data for this instance)")
+def fleet_rm(name, purge) -> None:
+    """Remove an instance. The volume is kept unless --purge."""
+    from . import fleet as _f
+    try: _f.remove(name, purge=purge)
+    except _f.FleetError as e: click.echo(f"error: {e}", err=True); sys.exit(1)
+
+
+@fleet_cli.command("logs")
+@click.argument("name")
+@click.option("-f", "--follow", is_flag=True)
+@click.option("--tail", default=200)
+def fleet_logs(name, follow, tail) -> None:
+    from . import fleet as _f
+    try: _f.logs(name, follow=follow, tail=tail)
+    except _f.FleetError as e: click.echo(f"error: {e}", err=True); sys.exit(1)
+
+
+@fleet_cli.command("exec", context_settings={"ignore_unknown_options": True})
+@click.argument("name")
+@click.argument("cmd", nargs=-1)
+def fleet_exec(name, cmd) -> None:
+    """Run a command inside an instance (default: bash). e.g. orch-fleet exec coach orchctl missions"""
+    from . import fleet as _f
+    try: sys.exit(_f.exec_in(name, list(cmd)))
+    except _f.FleetError as e: click.echo(f"error: {e}", err=True); sys.exit(1)
+
+
+def fleet_main() -> None:
+    fleet_cli()

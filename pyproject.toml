@@ -16,6 +16,7 @@ orch-mcp = "orch.mcp_server:main"
 msec = "orch.cli:msec_main"
 owatch = "orch.cli:owatch_main"
 oworker = "orch.cli:oworker_main"
+orch-fleet = "orch.cli:fleet_main"
 
 [build-system]
 requires = ["setuptools>=64"]

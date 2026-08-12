@@ -4,3 +4,4 @@ __pycache__/
 *.egg
 .venv/
 .env
+docker/cli-bundle/

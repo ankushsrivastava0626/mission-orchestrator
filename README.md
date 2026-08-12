@@ -181,6 +181,27 @@ This is how one Claude can quietly run a team of other agents on a remote box an
 
 ---
 
+## Run many instances as containers
+
+Want several separate orch instances on one machine, each with its own Telegram bot and its own isolated fleet of workers? Run them as Docker containers. One container is one complete orch: its own daemon, its own tmux, its own workers, its own bot. State lives on a per instance volume, so a container is disposable and the volume is its memory.
+
+```bash
+orch-fleet build                              # build the image (bakes in all agent CLIs)
+orch-fleet create coach    --bot-token <A>    # instance "coach"    on bot A
+orch-fleet create research --bot-token <B>    # instance "research" on bot B, fully isolated
+orch-fleet list                               # see them all
+orch-fleet logs coach -f                      # tail one
+orch-fleet exec coach orchctl missions        # run any orch command inside an instance
+```
+
+What you get:
+
+- **Isolation at the instance level.** Separate containers cannot see each other. Each has its own database, vault, and fleet of workers. The `--dangerously-skip-permissions` workers are contained to their box rather than your host.
+- **Stateful across restarts and crashes.** All state (the mission database, the vault, and every agent session) lives on a named volume mounted at the container home. The container runs with `--restart unless-stopped`, so if it crashes Docker starts a fresh one on the same volume, and orch's built in crash recovery resumes every in flight mission from its persisted session. Kill a container mid task and a new one continues it.
+- **No per instance setup.** Every agent CLI (claude, codex, antigravity, opencode, gemini) is baked into the image, plus the API and custom backends. Shared config (keys, default agent, vault passphrase) is inherited from one base file, and your existing agent logins are copied into each new instance automatically. You only supply a bot token.
+
+The manager is a thin, safe wrapper over Docker: `create`, `list`, `start`, `stop`, `restart`, `rm` (keeps the volume unless you pass `--purge`), `logs`, and `exec`.
+
 ## Extras
 
 ### ☎️ Voice escalation (`extras/jami-voice/`)
